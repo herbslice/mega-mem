@@ -1,0 +1,7 @@
+name: reference
+description: Cross-org universal technical knowledge.
+
+folders:
+  - patterns
+  - tooling
+  - models

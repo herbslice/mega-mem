@@ -1,0 +1,6 @@
+name: people
+description: Cross-org contacts.
+
+folders:
+  - external
+  - team

@@ -1,0 +1,7 @@
+name: mega-mem
+version: 0.1.0
+description: |
+  Recall context from a mega-mem vault on every turn (pre_llm_call) and at
+  session start (on_session_start). Honors the machine-local toggle file
+  written by `mega-mem hooks {enable,disable}`. Memory bridging is handled
+  separately by `mega-mem vault <ref> bridge hermes <scope>`.

@@ -1,0 +1,27 @@
+# Build outputs
+/bin/
+/dist/
+/mega-mem
+
+# Go artifacts
+*.test
+*.out
+coverage.txt
+vendor/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local config and secrets
+*.local.yaml
+*.local.yml
+.env
+.env.local
+
+# Local instructions (repo root only — template assets under share/ must be tracked)
+/AGENTS.md
+/CLAUDE.md
+/TODO.md

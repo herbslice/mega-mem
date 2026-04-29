@@ -1,0 +1,7 @@
+name: user
+description: Me-as-a-person — profile, preferences, cross-cutting todos.
+
+folders:
+  - profile
+  - preferences
+  - todos

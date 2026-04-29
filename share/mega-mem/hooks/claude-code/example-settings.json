@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "command": "/usr/local/share/mega-mem/hooks/claude-code/session-start.sh",
+        "env": {
+          "MEGAMEM_VAULT_PATH": "REPLACE_WITH_ABSOLUTE_VAULT_PATH",
+          "MEGAMEM_HARNESS": "claude-code"
+        }
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "command": "/usr/local/share/mega-mem/hooks/claude-code/user-prompt-submit.sh",
+        "env": {
+          "MEGAMEM_RECALL_URL": "http://127.0.0.1:8111/recall",
+          "MEGAMEM_TOP_K": "5"
+        }
+      }
+    ]
+  }
+}

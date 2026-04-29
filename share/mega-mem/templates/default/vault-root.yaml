@@ -1,0 +1,24 @@
+name: vault-root
+description: Top-level vault layout for a mega-mem vault.
+
+folders:
+  - agent-memory/{claude-code,codex,openclaw}
+  - orgs/{shared/infra}
+  - reference/{patterns,tooling,models}
+  - rules/{shared,claude-code-specific,codex-specific}
+  - user/{profile,preferences,todos}
+  - people
+  - inbox
+
+files:
+  - path: AGENTS.md
+    source: assets/AGENTS.md
+  - path: CLAUDE.md
+    source: assets/CLAUDE.md
+  - path: README.md
+    source: assets/README.md
+
+children:
+  - parent: orgs
+    template: org
+    exclude: [shared]

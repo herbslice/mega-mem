@@ -1,0 +1,10 @@
+name: org
+description: Canonical substructure for an organization folder.
+
+folders:
+  - infra
+  - projects
+  - decisions
+  - runbooks
+  - todos
+  - notes

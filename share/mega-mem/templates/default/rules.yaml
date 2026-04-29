@@ -1,0 +1,7 @@
+name: rules
+description: Cross-harness behavioral rules. Per-harness subdirectories isolate guidance that only applies to one harness.
+
+folders:
+  - shared
+  - claude-code-specific
+  - codex-specific

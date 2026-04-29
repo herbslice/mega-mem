@@ -1,0 +1,20 @@
+{
+  "hooks": [
+    {
+      "event_name": "SessionStart",
+      "command": "/usr/local/share/mega-mem/hooks/codex/session-start.sh",
+      "env": {
+        "MEGAMEM_VAULT_PATH": "REPLACE_WITH_ABSOLUTE_VAULT_PATH",
+        "MEGAMEM_HARNESS": "codex"
+      }
+    },
+    {
+      "event_name": "UserPromptSubmit",
+      "command": "/usr/local/share/mega-mem/hooks/codex/user-prompt-submit.sh",
+      "env": {
+        "MEGAMEM_RECALL_URL": "http://127.0.0.1:8111/recall",
+        "MEGAMEM_TOP_K": "5"
+      }
+    }
+  ]
+}
