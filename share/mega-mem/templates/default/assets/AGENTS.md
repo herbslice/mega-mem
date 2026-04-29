@@ -5,8 +5,8 @@ This vault is served by [mega-mem](https://github.com/herbslice/mega-mem) over M
 ## Primary behavior
 
 - **Recall before raw-reading.** Use the MCP `recall` tool to find relevant notes; do not traverse the whole vault. If you're reading more than a handful of files to answer a question, stop and reach for recall.
-- **Prefer editing canonical notes** over creating new sibling files. Mark older versions `status: superseded` and set `superseded_by`.
-- **Frontmatter is optional but recommended** on new notes. Katamaran field set is the suggested vocabulary; mega-mem itself doesn't enforce frontmatter, but folder-level defaults via `kat-schema.yaml` work cleanly.
+- **Prefer editing canonical notes** over creating new sibling files. If you must replace a note, clearly mark the old version as superseded so future readers know which is current.
+- **Frontmatter is optional.** mega-mem imposes no schema — bring your own conventions or none at all.
 
 ## Layout
 

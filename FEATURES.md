@@ -95,7 +95,7 @@ mega-mem does not ship a UI; it builds the layer that makes any UI work better. 
 - Binary file types (images, PDFs, video) skipped during indexing; in-PDF text extraction deferred to v2
 - Extract wikilinks (`[[target]]`, `[[target|alias]]`) into a link graph for graph-augmented recall
 - Extract tags (`#category`, nested `#projects/foo`) as first-class filters; `recall` grows a `tags:` parameter
-- Respect user-defined frontmatter without requiring Katamaran (Katamaran recommended, not mandatory)
+- Respect user-defined frontmatter — mega-mem imposes no schema. (Katamaran is one possible companion for users who want lifecycle tooling on the same vault, but it is not a dependency.)
 - Return backlinks alongside `recall` results as metadata
 - Verify `list_tasks` against the full Obsidian Tasks plugin grammar (emoji priorities, due/scheduled/recurrence, contexts, projects)
 - Wikilinks mode for shared-folder sources (Windows-friendly alternative to symlinks); config-selectable per vault

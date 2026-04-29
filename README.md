@@ -11,7 +11,7 @@ mega-mem is a personal knowledge base + TODO system that decouples your agent co
 - **Recall via hook.** A short `UserPromptSubmit` / `SessionStart` hook script per harness calls `recall` over HTTP and injects results as `additionalContext`. Same backend, both Claude Code and Codex; OpenClaw can run side-by-side with its built-in memorySearch.
 - **Cross-machine sync is your existing tool's job.** Syncthing / VS Code Remote SSH / git push-pull / Nextcloud / Dropbox handle the actual sync. The vault includes its `.mega-mem/index.sqlite`, so a low-power machine (Raspberry Pi, phone) that can't run an embedding model locally can still do recall against a pre-computed index that arrived via sync. See [`docs/SYNC-SUGGESTIONS.md`](./docs/SYNC-SUGGESTIONS.md).
 - **By-source layout.** Memories segregate by harness automatically (`agent-memory/claude-code/`, `agent-memory/codex/`, `agent-memory/openclaw/`). Audience filtering is path-based — `rules/shared/` loads everywhere, `rules/<harness>-specific/` loads only for that harness. No `audience:` frontmatter required for the common cases.
-- **Canonical rules in markdown.** Cross-harness rules live under `rules/`. [Katamaran](../katamaran-schema/) provides the recommended frontmatter vocabulary (`status:`, `canonical:`, `superseded_by:`) but is not required by mega-mem itself.
+- **Canonical rules in markdown.** Cross-harness rules live under `rules/` as plain markdown — bring your own frontmatter conventions or none at all.
 - **Plumbing, not an app.** No UI, no hosted service, no proprietary store. Edit in any markdown editor; serve to any agent. Project guidance files (AGENTS.md, CLAUDE.md) are explicitly *not* mega-mem's concern — those belong in your project repo.
 
 ## Status
@@ -24,7 +24,6 @@ Pre-alpha. CLI, scaffolding, vault management, and CRUD MCP tools work today. Th
 - **Embeddings**: Ollama by default (planned); pluggable via HTTP interface in v2
 - **Vector store**: sqlite-vec (planned)
 - **Lexical search**: ripgrep (planned)
-- **Frontmatter spec**: [Katamaran](../katamaran-schema/) (sister project)
 
 ## Quick start
 
@@ -113,16 +112,10 @@ See the shipped templates in `share/mega-mem/templates/default/` for working exa
 - **Layout is template-driven**, not hardcoded. `init` materializes the `vault-root` template (or any name via `--root-template`); `scaffold` applies templates to subpaths or reconciles the whole vault via `children:` recursion. Every template ships as an editable YAML file, not an embedded default.
 - **Templates** declare folder structure with inheritance (`inherit:`), Bash-style brace expansion (`orgs/{shared,personal}`), optional files (`files:` with `source:` or `content:` and an `on_conflict` policy), and recursion rules (`children:` — scan a parent directory and apply a named template to each subdir).
 - **Configs split by locality**. Machine-local engine config at `~/.config/mega-mem/engines/<alias>.yaml`; vault-local self-describing config at `<vault>/.mega-mem.yaml`. Engine points at vault; vault describes itself.
-- **Agent integration via symlinks** (see "How it works"). The `agent-memory/` subtree links to harness-native memory directories; `rules/` holds canonical cross-harness rules with Katamaran frontmatter.
+- **Agent integration via symlinks** (see "How it works"). The `agent-memory/` subtree links to harness-native memory directories; `rules/` holds canonical cross-harness rules.
 - **Idempotent scaffolding**. Folders that exist: no-op. Files with matching content: no-op. Files with differing content: skip with stderr warning and exit code 3 (or `--force` to overwrite). `--diff` also reports items in the target that aren't declared by the template.
 - **Template resolution** walks a search path (first hit wins): `--templates-dir` flag → `$MEGAMEM_TEMPLATES_DIR` → `<vault>/.mega-mem/templates/` → `$XDG_CONFIG_HOME/mega-mem/templates/` → `$XDG_DATA_HOME/mega-mem/templates/` → `/usr/local/share/mega-mem/templates/` → exe-relative fallback. Per-vault overrides Just Work.
 - **Single vault per process**. Multi-vault = multiple processes, each with its own engine config and port. A `mega-mem-fleet` supervisor for running many is planned (see `FEATURES.md` v1.x).
-
-## Related
-
-Agent-friendly tooling.
-
-- **[Katamaran](../katamaran-schema/)** — markdown frontmatter lifecycle CLI + schema. mega-mem uses Katamaran for vault metadata; Katamaran works on any vault without mega-mem.
 
 ## License
 
