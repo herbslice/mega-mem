@@ -25,3 +25,6 @@ vendor/
 /AGENTS.md
 /CLAUDE.md
 /TODO.md
+
+# ephemeral artifacts
+__pycache__
