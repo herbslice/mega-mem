@@ -1,6 +1,6 @@
 # Agent rules for this vault
 
-This vault is served by [mega-mem](https://github.com/herbslice/mega-mem) over MCP. Any agent (Claude Code, OpenClaw, Codex, raw API) can recall and write here through the shared protocol.
+This vault is served by [mega-mem](https://github.com/herbslice/mega-mem) over MCP. Any agent (Claude Code, Codex, Hermes, OpenClaw, raw API) can recall and write here through the shared protocol.
 
 ## Primary behavior
 
