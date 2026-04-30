@@ -26,11 +26,29 @@ emit_envelope() {
   fi
 }
 
-# Honor the machine-local toggle written by `mega-mem hooks {enable,disable}`.
+# Honor the machine-local per-harness toggle. See session-start.sh comment.
 state_file="${XDG_CONFIG_HOME:-$HOME/.config}/mega-mem/state.yaml"
-if [[ -f "$state_file" ]] && grep -qE '^hooks_enabled:[[:space:]]*false[[:space:]]*$' "$state_file"; then
-  emit_envelope ""
-  exit 0
+harness="codex"
+if [[ -f "$state_file" ]]; then
+  if grep -qE '^hooks_enabled:[[:space:]]*false[[:space:]]*$' "$state_file"; then
+    emit_envelope ""
+    exit 0
+  fi
+  value=$(awk -v h="$harness" '
+    /^hooks:[[:space:]]*$/ { in_hooks=1; next }
+    /^[^[:space:]]/ && in_hooks { in_hooks=0 }
+    in_hooks && match($0, "^[[:space:]]+" h ":[[:space:]]*(true|false)[[:space:]]*$") {
+      val = substr($0, RSTART, RLENGTH)
+      sub("^[[:space:]]+" h ":[[:space:]]*", "", val)
+      sub("[[:space:]]*$", "", val)
+      print val
+      exit
+    }
+  ' "$state_file")
+  if [[ "$value" == "false" ]]; then
+    emit_envelope ""
+    exit 0
+  fi
 fi
 
 url="${MEGAMEM_RECALL_URL:-http://127.0.0.1:8111/recall}"

@@ -9,78 +9,73 @@ import (
 
 // Claude Code memory layout:
 //
-//   ~/.claude/projects/<slug>/memory/MEMORY.md
-//   ~/.claude/projects/<slug>/memory/<topic>.md
+//   ~/.claude/projects/<slug>/                    <- per-project state
+//     memory/MEMORY.md                            <- per-project memory
+//     memory/<topic>.md                           <- per-project memory
+//     todos/, messages/, ...                      <- other state
 //
-// The parent of `<slug>/memory/` is configurable via the autoMemoryDirectory
-// setting in ~/.claude/settings.json (or .claude/settings.local.json or the
-// managed-policy file — explicitly NOT project settings, by Claude Code's
-// design).
+// With Options.IncludeMemory and empty Scope, Bridge symlinks the whole
+// `~/.claude/projects/` directory into the vault. This captures every
+// project's full state (memory plus everything else) and ensures new
+// project folders Claude Code creates after bridging end up inside the
+// vault automatically — no race window.
 //
-// Setting autoMemoryDirectory: <vault>/agent-memory/claude-code/ causes
-// future per-project memory dirs to be created inside the vault. The bridge
-// command takes a <slug> argument so it can also migrate that specific
-// project's existing memory dir into the vault. Other projects continue to
-// land in the vault automatically once the redirect is in place.
+// With a non-empty Scope (a project slug like `-home-user-work-foo`),
+// Bridge narrows to that one project's memory subdir, symlinking
+// ~/.claude/projects/<slug>/memory/ into the vault. The rest of the
+// project's state stays at its original location. Useful for users
+// piloting the bridge on a single project before committing to whole-dir.
+//
+// Without IncludeMemory (the default), Bridge only adds mega-mem to
+// ~/.claude/settings.json's mcpServers map. No filesystem moves; trivially
+// reversible.
 
 const (
 	claudeSettingsRel       = ".claude/settings.json"
 	claudeProjectsRel       = ".claude/projects"
 	claudeMemorySubdir      = "memory"
-	autoMemoryDirectoryKey  = "autoMemoryDirectory"
 	mcpServersKey           = "mcpServers"
 	mcpServerName           = "mega-mem"
-	claudeBridgeRootSegment = "agent-memory/claude-code"
+	claudeBridgeRootSegment = "agent-memory/claude-code/projects"
 )
 
-func planBridgeClaudeCode(scope, vaultRoot string, opts Options) (*Result, error) {
-	if scope == "" {
-		return nil, fmt.Errorf("claude-code bridge requires a project slug (e.g., -home-user-work-myrepo)")
-	}
+// claudeProjectsVaultPath returns <vault>/agent-memory/claude-code/projects/.
+func claudeProjectsVaultPath(vaultRoot string) string {
+	return filepath.Join(vaultRoot, claudeBridgeRootSegment)
+}
+
+// claudeProjectMemVaultPath returns the vault subdir for one project's
+// memory: <vault>/agent-memory/claude-code/projects/<slug>/memory/.
+func claudeProjectMemVaultPath(vaultRoot, slug string) string {
+	return filepath.Join(vaultRoot, claudeBridgeRootSegment, slug, claudeMemorySubdir)
+}
+
+func planBridgeClaudeCode(vaultRoot string, opts Options) (*Result, error) {
 	home, err := homeDir()
 	if err != nil {
 		return nil, err
 	}
 
 	settingsPath := filepath.Join(home, claudeSettingsRel)
-	bridgeRoot := filepath.Join(vaultRoot, claudeBridgeRootSegment)
-	defaultProjectMem := filepath.Join(home, claudeProjectsRel, scope, claudeMemorySubdir)
-	vaultProjectMem := filepath.Join(bridgeRoot, scope, claudeMemorySubdir)
+	res := &Result{Harness: HarnessClaudeCode, Scope: opts.Scope, DryRun: opts.DryRun}
 
-	res := &Result{Harness: HarnessClaudeCode, Scope: scope, DryRun: opts.DryRun}
-
-	if !opts.SkipMemory {
-		// Step 1: ensure the vault subdirectory exists.
-		res.Steps = append(res.Steps, Step{
-			Kind:        "mkdir",
-			Description: fmt.Sprintf("ensure %s exists", vaultProjectMem),
-			Apply: func() error {
-				return os.MkdirAll(vaultProjectMem, 0o755)
-			},
-		})
-
-		// Step 2: migrate existing memory if any.
-		if dirExists(defaultProjectMem) && !isEmptyDir(defaultProjectMem) {
-			res.Steps = append(res.Steps, Step{
-				Kind:        "copy",
-				Description: fmt.Sprintf("copy %s → %s", defaultProjectMem, vaultProjectMem),
-				Apply: func() error {
-					if err := copyTree(defaultProjectMem, vaultProjectMem); err != nil {
-						return err
-					}
-					return os.RemoveAll(defaultProjectMem)
-				},
-			})
+	if opts.IncludeMemory {
+		var steps []Step
+		if opts.Scope == "" {
+			// Whole-projects-dir mode.
+			defaultProj := filepath.Join(home, claudeProjectsRel)
+			vaultProj := claudeProjectsVaultPath(vaultRoot)
+			steps, err = codexMemorySteps(defaultProj, vaultProj)
+		} else {
+			// Single-project memory mode.
+			defaultMem := filepath.Join(home, claudeProjectsRel, opts.Scope, claudeMemorySubdir)
+			vaultMem := claudeProjectMemVaultPath(vaultRoot, opts.Scope)
+			steps, err = codexMemorySteps(defaultMem, vaultMem)
 		}
-
-		// Step 3: edit ~/.claude/settings.json to set autoMemoryDirectory.
-		res.Steps = append(res.Steps, Step{
-			Kind:        "settings-edit",
-			Description: fmt.Sprintf("set autoMemoryDirectory in %s to %s", settingsPath, bridgeRoot),
-			Apply: func() error {
-				return setClaudeAutoMemoryDirectory(settingsPath, bridgeRoot)
-			},
-		})
+		if err != nil {
+			return nil, err
+		}
+		res.Steps = append(res.Steps, steps...)
 	}
 
 	if !opts.SkipMCP {
@@ -93,35 +88,20 @@ func planBridgeClaudeCode(scope, vaultRoot string, opts Options) (*Result, error
 		})
 	}
 
-	if !opts.DryRun {
-		for _, st := range res.Steps {
-			if st.Apply == nil {
-				continue
-			}
-			if err := st.Apply(); err != nil {
-				return res, fmt.Errorf("%s: %w", st.Description, err)
-			}
-			res.Executed++
-		}
+	if err := applySteps(res, opts.DryRun); err != nil {
+		return res, err
 	}
 	return res, nil
 }
 
-func planUnbridgeClaudeCode(scope, vaultRoot string, opts Options) (*Result, error) {
-	if scope == "" {
-		return nil, fmt.Errorf("claude-code unbridge requires a project slug")
-	}
+func planUnbridgeClaudeCode(vaultRoot string, opts Options) (*Result, error) {
 	home, err := homeDir()
 	if err != nil {
 		return nil, err
 	}
 
 	settingsPath := filepath.Join(home, claudeSettingsRel)
-	bridgeRoot := filepath.Join(vaultRoot, claudeBridgeRootSegment)
-	defaultProjectMem := filepath.Join(home, claudeProjectsRel, scope, claudeMemorySubdir)
-	vaultProjectMem := filepath.Join(bridgeRoot, scope, claudeMemorySubdir)
-
-	res := &Result{Harness: HarnessClaudeCode, Scope: scope, DryRun: opts.DryRun}
+	res := &Result{Harness: HarnessClaudeCode, Scope: opts.Scope, DryRun: opts.DryRun}
 
 	if !opts.SkipMCP {
 		res.Steps = append(res.Steps, Step{
@@ -133,93 +113,70 @@ func planUnbridgeClaudeCode(scope, vaultRoot string, opts Options) (*Result, err
 		})
 	}
 
-	if !opts.SkipMemory {
-		// Copy vault content back to default location.
-		if dirExists(vaultProjectMem) && !isEmptyDir(vaultProjectMem) {
+	if opts.IncludeMemory {
+		var defaultPath, vaultPath string
+		if opts.Scope == "" {
+			defaultPath = filepath.Join(home, claudeProjectsRel)
+			vaultPath = claudeProjectsVaultPath(vaultRoot)
+		} else {
+			defaultPath = filepath.Join(home, claudeProjectsRel, opts.Scope, claudeMemorySubdir)
+			vaultPath = claudeProjectMemVaultPath(vaultRoot, opts.Scope)
+		}
+
+		if isSymlink(defaultPath) {
+			target, err := os.Readlink(defaultPath)
+			if err != nil {
+				return nil, fmt.Errorf("read symlink %s: %w", defaultPath, err)
+			}
+			if target != vaultPath {
+				return nil, fmt.Errorf("%s symlinks to %s, not %s; refusing to unbridge", defaultPath, target, vaultPath)
+			}
+		} else if dirExists(defaultPath) {
+			return nil, fmt.Errorf("%s is a real directory (not a symlink); nothing to unbridge", defaultPath)
+		}
+
+		res.Steps = append(res.Steps, Step{
+			Kind:        "unlink",
+			Description: fmt.Sprintf("remove symlink %s", defaultPath),
+			Apply:       func() error { return os.Remove(defaultPath) },
+		})
+
+		if dirExists(vaultPath) {
 			res.Steps = append(res.Steps, Step{
 				Kind:        "copy",
-				Description: fmt.Sprintf("copy %s → %s", vaultProjectMem, defaultProjectMem),
+				Description: fmt.Sprintf("copy %s → %s", vaultPath, defaultPath),
 				Apply: func() error {
-					if err := os.MkdirAll(defaultProjectMem, 0o755); err != nil {
+					if err := os.MkdirAll(defaultPath, 0o755); err != nil {
 						return err
 					}
-					return copyTree(vaultProjectMem, defaultProjectMem)
+					return copyTree(vaultPath, defaultPath)
 				},
 			})
 		}
 
-		// Remove autoMemoryDirectory from settings (only if it points
-		// at our bridge root — don't clobber a user-set custom path).
-		res.Steps = append(res.Steps, Step{
-			Kind:        "settings-edit",
-			Description: fmt.Sprintf("clear autoMemoryDirectory in %s if it equals %s", settingsPath, bridgeRoot),
-			Apply: func() error {
-				return clearClaudeAutoMemoryDirectory(settingsPath, bridgeRoot)
-			},
-		})
-
-		// Optionally remove the vault subtree.
 		if !opts.KeepVault {
 			res.Steps = append(res.Steps, Step{
 				Kind:        "rmdir",
-				Description: fmt.Sprintf("remove %s (vault subtree; --keep-vault to preserve)", filepath.Join(bridgeRoot, scope)),
-				Apply: func() error {
-					return os.RemoveAll(filepath.Join(bridgeRoot, scope))
-				},
+				Description: fmt.Sprintf("remove %s (vault subtree; --keep-vault to preserve)", vaultPath),
+				Apply:       func() error { return os.RemoveAll(vaultPath) },
 			})
 		}
 	}
 
-	if !opts.DryRun {
-		for _, st := range res.Steps {
-			if st.Apply == nil {
-				continue
-			}
-			if err := st.Apply(); err != nil {
-				return res, fmt.Errorf("%s: %w", st.Description, err)
-			}
-			res.Executed++
-		}
+	if err := applySteps(res, opts.DryRun); err != nil {
+		return res, err
 	}
 	return res, nil
 }
 
-// setClaudeAutoMemoryDirectory updates ~/.claude/settings.json to set
-// autoMemoryDirectory. Preserves all other settings. Creates the file if
-// missing. If the key is already set to a different value, returns an error
-// rather than silently overwriting — the user should review.
-func setClaudeAutoMemoryDirectory(settingsPath, value string) error {
-	settings, err := readJSONObject(settingsPath)
+// listClaudeScopes enumerates project slugs under ~/.claude/projects/.
+// Returns the dir basenames (slugs).
+func listClaudeScopes() ([]string, error) {
+	home, err := homeDir()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if existing, ok := settings[autoMemoryDirectoryKey].(string); ok && existing != value {
-		return fmt.Errorf("%s already sets %s=%q; refusing to overwrite", settingsPath, autoMemoryDirectoryKey, existing)
-	}
-	settings[autoMemoryDirectoryKey] = value
-	return writeJSONObject(settingsPath, settings)
-}
-
-// clearClaudeAutoMemoryDirectory removes the autoMemoryDirectory key only
-// if it equals the expected bridge root. If it points elsewhere, the user
-// has set a custom value we shouldn't touch.
-func clearClaudeAutoMemoryDirectory(settingsPath, expected string) error {
-	settings, err := readJSONObject(settingsPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	current, ok := settings[autoMemoryDirectoryKey].(string)
-	if !ok {
-		return nil
-	}
-	if current != expected {
-		return fmt.Errorf("%s sets %s=%q (expected %q); leaving untouched", settingsPath, autoMemoryDirectoryKey, current, expected)
-	}
-	delete(settings, autoMemoryDirectoryKey)
-	return writeJSONObject(settingsPath, settings)
+	return listDirNames(filepath.Join(home, claudeProjectsRel))
 }
 
 // setClaudeMCPServer adds or updates a single mcpServers entry in the

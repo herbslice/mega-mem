@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 
+	"github.com/herbslice/mega-mem/internal/agents"
 	"github.com/herbslice/mega-mem/internal/bridge"
 	"github.com/herbslice/mega-mem/internal/config"
 	"github.com/herbslice/mega-mem/internal/scaffold"
@@ -21,6 +22,13 @@ import (
 	"github.com/herbslice/mega-mem/internal/templates"
 	"github.com/herbslice/mega-mem/internal/vault"
 )
+
+// silentExitErr signals main() to exit with a specific code without
+// printing the cobra-default error message. RunE handlers print to stderr
+// themselves and return this when they want a particular exit code.
+type silentExitErr struct{ code int }
+
+func (s *silentExitErr) Error() string { return "" }
 
 // version is overridden at build time via -ldflags. Default is "0.0.0"
 // to denote pre-release alpha (no public release tagged yet).
@@ -47,6 +55,10 @@ func mkResolver(extras ...string) *templates.Resolver {
 func main() {
 	preprocess()
 	if err := newRootCmd().Execute(); err != nil {
+		var silent *silentExitErr
+		if errors.As(err, &silent) {
+			os.Exit(silent.code)
+		}
 		var skipped *scaffold.SkippedError
 		if errors.As(err, &skipped) {
 			fmt.Fprintln(os.Stderr, err)
@@ -66,8 +78,7 @@ var vaultSubcommands = map[string]bool{
 	"scaffold": true,
 	"serve":    true,
 	"status":   true,
-	"bridge":   true,
-	"unbridge": true,
+	"tell":     true,
 }
 
 // preprocess extracts the vault ref from `mega-mem [...] vault <ref> <verb>`
@@ -107,26 +118,284 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.PersistentFlags().StringVar(&templatesDirFlag, "templates-dir", "",
-		"Prepend this directory to the template search path (highest priority)")
-	root.AddCommand(newVaultCmd(), newVaultsCmd(), newTemplateCmd(), newHooksCmd())
+		"Prepend a directory to the template search path (highest priority). See `mega-mem templates path` for the full search order.")
+	root.AddCommand(newVaultCmd(), newVaultsCmd(), newTemplatesCmd(), newAgentsCmd())
 	return root
 }
 
-// --- hooks (machine-local toggle) ---
+// --- agents (harness integrations) ---
 
-func newHooksCmd() *cobra.Command {
+func newAgentsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "agents",
+		Short: "Wire mega-mem into agent harnesses",
+		Long: `Manage integrations with agent harnesses (Claude Code, Codex, Hermes, OpenClaw).
+
+Subcommands:
+
+    bridge      Wire a harness into a vault & its MCP server
+    unbridge    Reverse a bridge
+    list        Discover harnesses on this machine and show bridge state
+    hooks       Toggle per-harness hook injection (enable/disable/status)
+
+By default, bridge only wires the harness's MCP-client config to point at
+mega-mem. Pass --memory to also redirect the harness's memory directory
+into the vault (a heavier, harder-to-undo operation).`,
+	}
+	cmd.AddCommand(
+		newAgentsBridgeCmd(),
+		newAgentsUnbridgeCmd(),
+		newAgentsListCmd(),
+		newAgentsHooksCmd(),
+	)
+	return cmd
+}
+
+// resolveVaultForAgents returns the vault path and alias for the agents
+// command tree. If --vault is set, looks it up; otherwise falls back to
+// the only registered vault. Errors if multiple vaults are registered
+// without a --vault flag.
+func resolveVaultForAgents(flag string) (path, alias string, err error) {
+	reg, err := config.LoadRegistry()
+	if err != nil {
+		return "", "", err
+	}
+	if flag != "" {
+		entry, ok := reg.Vaults[flag]
+		if !ok {
+			return "", "", fmt.Errorf("vault alias %q not registered", flag)
+		}
+		return entry.Path, flag, nil
+	}
+	if len(reg.Vaults) == 1 {
+		for a, e := range reg.Vaults {
+			return e.Path, a, nil
+		}
+	}
+	if len(reg.Vaults) == 0 {
+		return "", "", fmt.Errorf("no vaults registered (run `mega-mem vaults register <alias>` first)")
+	}
+	names := make([]string, 0, len(reg.Vaults))
+	for a := range reg.Vaults {
+		names = append(names, a)
+	}
+	sort.Strings(names)
+	return "", "", fmt.Errorf("multiple vaults registered (%s); pass --vault <alias>", strings.Join(names, ", "))
+}
+
+func newAgentsBridgeCmd() *cobra.Command {
+	var vaultFlag string
+	var apply, includeMemory, skipMCP, listScopes bool
+	var scope, mcpURL string
+	cmd := &cobra.Command{
+		Use:   "bridge <harness>",
+		Short: "Wire a harness into a vault & its MCP server",
+		Long: `Add mega-mem's MCP server to a harness's config. With --memory, also
+redirect the harness's memory directory into the vault.
+
+Default = MCP only: the lightest, easiest-to-undo bridge. Best fit for
+the common case of "I have an Obsidian vault, give me semantic search
+from Claude Code."
+
+With --memory, the harness's memory directory is moved into the vault
+and replaced with a symlink:
+
+  - claude-code:  ~/.claude/projects/                    → vault
+  - codex:        ~/.codex/memories/                     → vault
+  - hermes:       ~/.hermes/memories/                    → vault
+  - openclaw:     ~/.openclaw/<workspace>/memory/        → vault (per workspace)
+
+Pass --scope to narrow to a single project/workspace; otherwise --memory
+captures every instance found.
+
+Dry-run by default: prints the steps without modifying anything.
+Pass --apply to commit changes.`,
+		Example: `  mega-mem agents bridge claude-code                     # MCP only
+  mega-mem agents bridge --apply --memory claude-code     # MCP + symlink projects/
+  mega-mem agents bridge --apply --memory --scope -tmp claude-code   # narrow to one project
+  mega-mem agents bridge claude-code --list-scopes        # enumerate project slugs
+  mega-mem agents bridge --vault work --apply --memory codex
+  mega-mem agents bridge --apply --no-mcp --memory hermes # memory only, no MCP edit`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			h, err := bridge.ParseHarness(args[0])
+			if err != nil {
+				return err
+			}
+			if listScopes {
+				res, err := bridge.Bridge(h, "", bridge.Options{ListScopes: true})
+				if err != nil {
+					return err
+				}
+				if len(res.Scopes) == 0 {
+					fmt.Println("(no scopes discovered)")
+					return nil
+				}
+				for _, s := range res.Scopes {
+					fmt.Println(s)
+				}
+				return nil
+			}
+			vp, _, err := resolveVaultForAgents(vaultFlag)
+			if err != nil {
+				return err
+			}
+			res, err := bridge.Bridge(h, vp, bridge.Options{
+				DryRun:        !apply,
+				Scope:         scope,
+				IncludeMemory: includeMemory,
+				SkipMCP:       skipMCP,
+				MCPURL:        mcpURL,
+			})
+			if err != nil {
+				return err
+			}
+			printBridgeResult(os.Stdout, res, apply, "bridge")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&vaultFlag, "vault", "", "Target vault alias (defaults to the only registered vault)")
+	cmd.Flags().BoolVar(&apply, "apply", false, "Commit changes (default: dry-run)")
+	cmd.Flags().BoolVar(&includeMemory, "memory", false, "Also redirect the harness's memory directory into the vault")
+	cmd.Flags().StringVar(&scope, "scope", "", "Narrow to a single project/workspace (defaults to all)")
+	cmd.Flags().BoolVar(&skipMCP, "no-mcp", false, "Skip the MCP-config step (use with --memory for memory-only)")
+	cmd.Flags().StringVar(&mcpURL, "mcp-url", "", "Override the MCP server URL (default: http://127.0.0.1:8111/sse)")
+	cmd.Flags().BoolVar(&listScopes, "list-scopes", false, "Enumerate discoverable scopes for this harness and exit")
+	return cmd
+}
+
+func newAgentsUnbridgeCmd() *cobra.Command {
+	var vaultFlag string
+	var apply, includeMemory, skipMCP, keepVault bool
+	var scope string
+	cmd := &cobra.Command{
+		Use:   "unbridge <harness>",
+		Short: "Reverse a bridge: remove MCP entry and (with --memory) restore files",
+		Long: `Reverse a previous bridge. By default, only removes mega-mem from the
+harness's MCP-client config. Pass --memory to also restore the harness's
+memory directory from the vault and remove the redirect.
+
+Dry-run by default: prints the steps without modifying anything.`,
+		Example: `  mega-mem agents unbridge claude-code                  # remove MCP entry
+  mega-mem agents unbridge --apply --memory claude-code  # also undo memory bridge
+  mega-mem agents unbridge --apply --memory --keep-vault codex   # restore but keep vault subtree
+  mega-mem agents unbridge --vault work --apply codex`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			h, err := bridge.ParseHarness(args[0])
+			if err != nil {
+				return err
+			}
+			vp, _, err := resolveVaultForAgents(vaultFlag)
+			if err != nil {
+				return err
+			}
+			res, err := bridge.Unbridge(h, vp, bridge.Options{
+				DryRun:        !apply,
+				Scope:         scope,
+				IncludeMemory: includeMemory,
+				SkipMCP:       skipMCP,
+				KeepVault:     keepVault,
+			})
+			if err != nil {
+				return err
+			}
+			printBridgeResult(os.Stdout, res, apply, "unbridge")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&vaultFlag, "vault", "", "Target vault alias (defaults to the only registered vault)")
+	cmd.Flags().BoolVar(&apply, "apply", false, "Commit changes (default: dry-run)")
+	cmd.Flags().BoolVar(&includeMemory, "memory", false, "Also restore the harness's memory directory from the vault")
+	cmd.Flags().StringVar(&scope, "scope", "", "Narrow to a single project/workspace")
+	cmd.Flags().BoolVar(&skipMCP, "no-mcp", false, "Skip the MCP-config step")
+	cmd.Flags().BoolVar(&keepVault, "keep-vault", false, "Leave the vault subtree intact after restoring files")
+	return cmd
+}
+
+func newAgentsListCmd() *cobra.Command {
+	var format string
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "Discover harnesses on this machine and show bridge state",
+		RunE: func(_ *cobra.Command, _ []string) error {
+			reg, err := config.LoadRegistry()
+			if err != nil {
+				return err
+			}
+			state, err := config.LoadState()
+			if err != nil {
+				return err
+			}
+			rows, err := agents.List(reg, state)
+			if err != nil {
+				return err
+			}
+			return printAgentsList(os.Stdout, rows, format)
+		},
+	}
+	cmd.Flags().StringVar(&format, "format", "text", "Output format: text | json")
+	return cmd
+}
+
+func printAgentsList(w io.Writer, rows []agents.Status, format string) error {
+	switch strings.ToLower(format) {
+	case "json":
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(rows)
+	case "", "text":
+		fmt.Fprintf(w, "%-12s  %-9s  %-10s  %-3s  %-22s  %s\n",
+			"HARNESS", "INSTALLED", "VAULT", "MCP", "MEMORY", "HOOKS")
+		for _, r := range rows {
+			installed := "no"
+			if r.Installed {
+				installed = "yes"
+			}
+			mcp := "—"
+			if r.MCPWired {
+				mcp = "✓"
+			}
+			mem := "no"
+			if r.MemoryBridged {
+				mem = r.Scope
+			}
+			vault := "—"
+			if r.Vault != "" {
+				vault = r.Vault
+			}
+			hooks := "—"
+			if r.Installed {
+				hooks = "off"
+				if r.HooksEnabled {
+					hooks = "on"
+				}
+			}
+			fmt.Fprintf(w, "%-12s  %-9s  %-10s  %-3s  %-22s  %s\n",
+				r.Harness, installed, vault, mcp, mem, hooks)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown format %q (valid: text, json)", format)
+	}
+}
+
+func newAgentsHooksCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "hooks",
-		Short: "Toggle mega-mem hook injection (machine-local)",
-		Long: `Toggle whether mega-mem hook scripts inject context into your harness.
+		Short: "Toggle per-harness hook injection",
+		Long: `Per-harness toggle for mega-mem's hook scripts.
 
 State lives at ~/.config/mega-mem/state.yaml (machine-local; not synced).
-The shipped hook scripts read this file at the top of each invocation, so
-toggling takes effect on the next prompt without restarting the harness.
+The shipped hook scripts read this file at the top of each invocation,
+so toggling takes effect on the next prompt without restarting the
+harness.
 
-This is independent of per-request "persona" tuning passed via the recall
-MCP tool — use the toggle when you want hooks off entirely for a stretch
-of work; use a persona when you want different recall settings per call.`,
+Each harness has its own enable/disable flag. Absent harness key =
+enabled (fail-open default).`,
+		Example: `  mega-mem agents hooks status                 # show all
+  mega-mem agents hooks disable codex          # codex only
+  mega-mem agents hooks enable                 # all harnesses`,
 	}
 	cmd.AddCommand(newHooksEnableCmd(), newHooksDisableCmd(), newHooksStatusCmd())
 	return cmd
@@ -134,13 +403,21 @@ of work; use a persona when you want different recall settings per call.`,
 
 func newHooksEnableCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "enable",
-		Short: "Re-enable mega-mem hook injection",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			if err := config.SetHooksEnabled(true); err != nil {
+		Use:   "enable [<harness>]",
+		Short: "Re-enable mega-mem hook injection (all harnesses, or one)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if len(args) == 1 {
+				if err := config.SetHooksEnabledForHarness(args[0], true); err != nil {
+					return err
+				}
+				fmt.Printf("hooks: %s enabled\n", args[0])
+				return nil
+			}
+			if err := config.SetAllHooksEnabled(true); err != nil {
 				return err
 			}
-			fmt.Println("hooks: enabled")
+			fmt.Println("hooks: all enabled")
 			return nil
 		},
 	}
@@ -148,13 +425,21 @@ func newHooksEnableCmd() *cobra.Command {
 
 func newHooksDisableCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "disable",
-		Short: "Disable mega-mem hook injection without unwiring it",
-		RunE: func(_ *cobra.Command, _ []string) error {
-			if err := config.SetHooksEnabled(false); err != nil {
+		Use:   "disable [<harness>]",
+		Short: "Disable mega-mem hook injection (all harnesses, or one)",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if len(args) == 1 {
+				if err := config.SetHooksEnabledForHarness(args[0], false); err != nil {
+					return err
+				}
+				fmt.Printf("hooks: %s disabled\n", args[0])
+				return nil
+			}
+			if err := config.SetAllHooksEnabled(false); err != nil {
 				return err
 			}
-			fmt.Println("hooks: disabled")
+			fmt.Println("hooks: all disabled")
 			return nil
 		},
 	}
@@ -163,19 +448,21 @@ func newHooksDisableCmd() *cobra.Command {
 func newHooksStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
-		Short: "Show whether hooks are currently enabled",
+		Short: "Show per-harness hook injection status",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			s, err := config.LoadState()
 			if err != nil {
 				return err
 			}
 			path, _ := config.StatePath()
-			label := "enabled"
-			if !s.HooksEnabledOrDefault() {
-				label = "disabled"
+			for _, st := range s.AllHookStatuses() {
+				label := "enabled"
+				if !st.Enabled {
+					label = "disabled"
+				}
+				fmt.Printf("%-12s  %s\n", st.Harness, label)
 			}
-			fmt.Printf("hooks: %s\n", label)
-			fmt.Printf("state: %s\n", path)
+			fmt.Printf("\nstate: %s\n", path)
 			return nil
 		},
 	}
@@ -196,8 +483,51 @@ All vault operations take the form:
 <alias> is a vault registered via 'mega-mem vaults register'.
 See 'mega-mem vaults list' for registered aliases.`,
 	}
-	cmd.AddCommand(newInitCmd(), newScaffoldCmd(), newServeCmd(), newStatusCmd(), newBridgeCmd(), newUnbridgeCmd())
+	cmd.AddCommand(newInitCmd(), newScaffoldCmd(), newServeCmd(), newStatusCmd(), newVaultTellCmd())
 	return cmd
+}
+
+func newVaultTellCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "tell",
+		Short: "Print the alias of the vault containing the current directory",
+		Long: `Walk up from the current working directory looking for a .mega-mem.yaml
+marker, then print the alias of the matching registered vault.
+
+Useful in shell prompts and scripts:
+
+    mega-mem vault $(mega-mem vault tell) status
+
+Exit codes:
+    0   match printed
+    4   not in a vault, or vault is unregistered`,
+		Example: `  cd ~/my-vault && mega-mem vault tell
+  mega-mem vault mykb tell                 # echoes "mykb" (degenerate; useful in shell)`,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if vaultRef != "" {
+				fmt.Println(vaultRef)
+				return nil
+			}
+			cwd, err := os.Getwd()
+			if err != nil {
+				return err
+			}
+			alias, path, err := vault.WhereAmI(cwd)
+			if err == nil {
+				fmt.Println(alias)
+				return nil
+			}
+			if errors.Is(err, vault.ErrUnregistered) {
+				fmt.Fprintf(os.Stderr, "(unregistered) %s\n", path)
+				return &silentExitErr{code: 4}
+			}
+			if errors.Is(err, vault.ErrNotInVault) {
+				fmt.Fprintln(os.Stderr, "(not in a vault)")
+				return &silentExitErr{code: 4}
+			}
+			return err
+		},
+	}
 }
 
 func requireVaultRef() (string, error) {
@@ -208,27 +538,31 @@ func requireVaultRef() (string, error) {
 }
 
 func newInitCmd() *cobra.Command {
-	var force, dryRun, gitInit bool
+	var force, dryRun, gitInit, doScaffold bool
 	var rootTemplate string
 	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "Scaffold a new vault from the root template",
-		Long: `Scaffold the registered vault using the root template (default: vault-root).
+		Short: "Mark a directory as a mega-mem vault (writes .mega-mem.yaml)",
+		Long: `Make the registered vault a mega-mem vault.
 
-Invoke as:  mega-mem vault <alias> init [flags]
+By default, init writes only .mega-mem.yaml — the marker file mega-mem
+uses to identify a vault. This is friendly to adoption: point an alias
+at your existing Obsidian vault, run init, done. No folder pollution.
 
-Safe on non-empty directories: folders that exist are no-ops; files with
-matching content are no-ops; differing files are skipped unless --force.
-Leaves an existing .mega-mem.yaml untouched unless --force.
+Pass --scaffold to also apply the default vault-root template (or any
+template named via --root-template). When --root-template is set
+explicitly, --scaffold is implied.
 
 The --git flag runs 'git init' (if .git is missing) and writes a starter
 .gitignore that excludes per-machine search index, sync-conflict files,
-and editor backups. mega-mem does not wrap commit/push — see
-docs/SYNC-SUGGESTIONS.md for cron and pre-commit recipes.`,
-		Example: `  mega-mem vault mykb init
-  mega-mem vault mykb init --dry-run
+and editor backups.
+
+Templates: see 'mega-mem templates list' and 'mega-mem templates show vault-root'.`,
+		Example: `  mega-mem vault mykb init                       # adopt a directory; only writes .mega-mem.yaml
   mega-mem vault mykb init --git
-  mega-mem vault mykb init --force`,
+  mega-mem vault mykb init --scaffold             # also apply the default layout
+  mega-mem vault mykb init --root-template custom # custom template (implies --scaffold)
+  mega-mem vault mykb init --dry-run --scaffold`,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			vp, err := requireVaultRef()
 			if err != nil {
@@ -237,15 +571,17 @@ docs/SYNC-SUGGESTIONS.md for cron and pre-commit recipes.`,
 			return vault.Init(vp, vault.InitOpts{
 				Force:        force,
 				DryRun:       dryRun,
+				Scaffold:     doScaffold,
 				RootTemplate: rootTemplate,
 				TemplatesDir: templatesDirFlag,
 				Git:          gitInit,
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "Use an existing non-empty directory and overwrite conflicting files")
+	cmd.Flags().BoolVar(&force, "force", false, "Overwrite an existing .mega-mem.yaml (and conflicting files when scaffolding)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would happen without writing")
-	cmd.Flags().StringVar(&rootTemplate, "root-template", "", "Override the root template name (default: vault-root)")
+	cmd.Flags().BoolVar(&doScaffold, "scaffold", false, "Also apply the default vault-root template")
+	cmd.Flags().StringVar(&rootTemplate, "root-template", "", "Apply this template instead of vault-root (implies --scaffold)")
 	cmd.Flags().BoolVar(&gitInit, "git", false, "Run 'git init' and write a starter .gitignore")
 	return cmd
 }
@@ -372,123 +708,6 @@ func newStatusCmd() *cobra.Command {
 			return nil
 		},
 	}
-}
-
-func newBridgeCmd() *cobra.Command {
-	var apply, skipMemory, skipMCP bool
-	var mcpURL string
-	cmd := &cobra.Command{
-		Use:   "bridge <harness> <scope>",
-		Short: "Wire a harness's memory + MCP server into the vault",
-		Long: `Redirect a harness's auto-memory location to live under
-agent-memory/<harness>/<scope>/ in the vault, and add mega-mem's MCP server
-to the harness's MCP-client config.
-
-Per-harness memory mechanism:
-  - claude-code:  edits autoMemoryDirectory in ~/.claude/settings.json
-  - codex:        symlinks ~/.codex/memories/ to the vault subtree
-  - openclaw:     edits agents.defaults.workspace in ~/.openclaw/openclaw.json
-  - hermes:       symlinks ~/.hermes/memories/ to the vault subtree
-
-Per-harness MCP-config edit:
-  - claude-code:  adds mcpServers["mega-mem"] in ~/.claude/settings.json
-  - codex:        adds [mcp_servers.mega-mem] in ~/.codex/config.toml
-  - openclaw:     adds mcp.servers["mega-mem"] in ~/.openclaw/openclaw.json
-  - hermes:       adds mcp_servers["mega-mem"] in ~/.hermes/config.yaml
-
-Migrates any existing memory at the harness's default location into the
-vault before applying the redirect.
-
-Dry-run by default: prints the steps without modifying anything. Pass
---apply (before the positional args) to commit changes.
-
-Note: Claude Code project slugs start with a dash (encoded path of the
-project's git root). Put --apply BEFORE the positional args, or use --
-to separate them.`,
-		Example: `  mega-mem vault mykb bridge claude-code -home-user-work-myrepo
-  mega-mem vault mykb bridge --apply claude-code -home-user-work-myrepo
-  mega-mem vault mykb bridge codex personal --apply
-  mega-mem vault mykb bridge openclaw workspace-main --apply
-  mega-mem vault mykb bridge hermes shared --apply
-  mega-mem vault mykb bridge --apply --no-mcp claude-code -home-...    # memory only
-  mega-mem vault mykb bridge --apply --no-memory hermes shared        # MCP only`,
-		Args: cobra.ExactArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
-			vp, err := requireVaultRef()
-			if err != nil {
-				return err
-			}
-			h, err := bridge.ParseHarness(args[0])
-			if err != nil {
-				return err
-			}
-			res, err := bridge.Bridge(h, args[1], vp, bridge.Options{
-				DryRun:     !apply,
-				SkipMemory: skipMemory,
-				SkipMCP:    skipMCP,
-				MCPURL:     mcpURL,
-			})
-			if err != nil {
-				return err
-			}
-			printBridgeResult(os.Stdout, res, apply, "bridge")
-			return nil
-		},
-	}
-	cmd.Flags().BoolVar(&apply, "apply", false, "Commit changes (default: dry-run)")
-	cmd.Flags().BoolVar(&skipMemory, "no-memory", false, "Skip the memory-redirect step (only edit MCP config)")
-	cmd.Flags().BoolVar(&skipMCP, "no-mcp", false, "Skip the MCP-config step (only redirect memory)")
-	cmd.Flags().StringVar(&mcpURL, "mcp-url", "", "Override the MCP server URL (default: http://127.0.0.1:8111/sse)")
-	cmd.Flags().SetInterspersed(false)
-	return cmd
-}
-
-func newUnbridgeCmd() *cobra.Command {
-	var apply, keepVault, skipMemory, skipMCP bool
-	cmd := &cobra.Command{
-		Use:   "unbridge <harness> <scope>",
-		Short: "Reverse a bridge: copy vault content back, remove the redirect",
-		Long: `Undo a bridge by copying vault content back to the harness's default
-location, removing the config redirect or symlink, and removing mega-mem
-from the harness's MCP-client config.
-
-By default, the vault subtree under agent-memory/<harness>/<scope>/ is
-removed after the copy succeeds. Pass --keep-vault to preserve it.
-
-Dry-run by default: prints the steps without modifying anything. Pass
---apply (before the positional args) to commit changes.`,
-		Example: `  mega-mem vault mykb unbridge claude-code -home-user-work-myrepo
-  mega-mem vault mykb unbridge --apply --keep-vault codex personal
-  mega-mem vault mykb unbridge --apply --no-mcp hermes shared        # leave MCP wired`,
-		Args: cobra.ExactArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
-			vp, err := requireVaultRef()
-			if err != nil {
-				return err
-			}
-			h, err := bridge.ParseHarness(args[0])
-			if err != nil {
-				return err
-			}
-			res, err := bridge.Unbridge(h, args[1], vp, bridge.Options{
-				DryRun:     !apply,
-				KeepVault:  keepVault,
-				SkipMemory: skipMemory,
-				SkipMCP:    skipMCP,
-			})
-			if err != nil {
-				return err
-			}
-			printBridgeResult(os.Stdout, res, apply, "unbridge")
-			return nil
-		},
-	}
-	cmd.Flags().BoolVar(&apply, "apply", false, "Commit changes (default: dry-run)")
-	cmd.Flags().BoolVar(&keepVault, "keep-vault", false, "Leave the vault subtree intact after unbridging")
-	cmd.Flags().BoolVar(&skipMemory, "no-memory", false, "Skip the memory-restore step (only remove MCP config)")
-	cmd.Flags().BoolVar(&skipMCP, "no-mcp", false, "Skip the MCP-config step (only restore memory)")
-	cmd.Flags().SetInterspersed(false)
-	return cmd
 }
 
 func printBridgeResult(w io.Writer, res *bridge.Result, applied bool, verb string) {
@@ -924,12 +1143,13 @@ func newVaultsShowCmd() *cobra.Command {
 	}
 }
 
-// --- template (inspection) ---
+// --- templates (inspection) ---
 
-func newTemplateCmd() *cobra.Command {
+func newTemplatesCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "template",
-		Short: "Inspect templates (resolved across the search path)",
+		Use:     "templates",
+		Aliases: []string{"template"},
+		Short:   "Inspect templates (resolved across the search path)",
 	}
 
 	var vaultRefFlag string

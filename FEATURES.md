@@ -14,14 +14,17 @@ mega-mem does not ship a UI; it builds the layer that makes any UI work better. 
 ## v1 (MVP)
 
 **Core CLI**
-- `mega-mem vault <ref> init [--force] [--dry-run] [--root-template <name>] [--git]`
+- `mega-mem vault <ref> init [--force] [--dry-run] [--scaffold] [--root-template <name>] [--git]` — writes `.mega-mem.yaml` only by default; `--scaffold` (or non-empty `--root-template`) also applies the default `vault-root` template. Designed so adopting an existing Obsidian vault is friction-free.
 - `mega-mem vault <ref> scaffold [<template> <subpath>] [--force] [--dry-run] [--diff] [--no-recurse] [--tree] [--format text|json]`
 - `mega-mem vault <ref> serve [--config <path>]`
 - `mega-mem vault <ref> status`
-- `mega-mem vault <ref> bridge <harness> <scope> [--apply] [--no-memory] [--no-mcp]` — wires harness-native memory location into the vault and adds mega-mem to the harness's MCP-client config. Per-harness memory behavior: config-redirect via `autoMemoryDirectory` for Claude Code; directory symlink for Codex (`~/.codex/memories/`), Hermes (`~/.hermes/memories/`), and OpenClaw (`~/.openclaw/<workspace>/memory/`). Memory-only by design — persona files (SOUL.md, IDENTITY.md), project guidance (AGENTS.md, CLAUDE.md), and runtime state (state/, scripts/) are deliberately not captured. Migrates existing files into the vault before redirecting. Dry-run by default.
-- `mega-mem vault <ref> unbridge <harness> <scope> [--apply] [--keep-vault]` — reverses a bridge: copies vault content back to the harness's default location and removes the redirect or symlink. Required for clean uninstall.
+- `mega-mem vault tell` — print the alias of the registered vault containing the current working directory; exit 4 if not in a vault. Useful in shell scripts and prompts.
+- `mega-mem agents bridge <harness> [--vault <a>] [--memory] [--scope <s>] [--mcp-url <u>] [--apply] [--no-mcp] [--list-scopes]` — wires mega-mem's MCP server into the harness's config. **Default = MCP only.** With `--memory`, also redirects the harness's memory directory into the vault: symlink-replace on `~/.claude/projects/` (Claude Code), `~/.codex/memories/` (Codex), `~/.hermes/memories/` (Hermes), or every `~/.openclaw/<ws>/memory/` (OpenClaw). With `--scope`, narrows to one instance. With `--list-scopes`, enumerates discoverable scope names. `--vault` defaults to the only registered vault if there's exactly one.
+- `mega-mem agents unbridge <harness> [--vault <a>] [--memory] [--scope <s>] [--apply] [--no-mcp] [--keep-vault]` — reverses a bridge. By default, only removes mega-mem from the harness's MCP-client config; `--memory` also restores the harness's memory directory from the vault.
+- `mega-mem agents list [--format text|json]` — discover harness installations on this machine and report bridge state (installed, MCP wired, memory bridged → which vault, hooks on/off).
+- `mega-mem agents hooks {enable,disable,status} [<harness>]` — per-harness machine-local toggle for mega-mem's shipped hook scripts. Absent harness key = enabled (fail-open default).
 - `mega-mem vaults {list,register,unregister,rename,show,check}` — `check [<alias>] [--drift] [--conflicts] [--format text|json]` verifies registered vaults against the filesystem; `--conflicts` flags Syncthing/Nextcloud sync-conflict files and git merge artifacts.
-- `mega-mem template {list,show,sources,path}` with `--vault <ref>`, `--format text|yaml|json`, `--decorate`
+- `mega-mem templates {list,show,sources,path}` with `--vault <ref>`, `--format text|yaml|json`, `--decorate`. (`template` accepted as a singular alias.)
 - Vault ref = alias only, resolved via `~/.config/mega-mem/vaults.yaml`; paths are registered once via `mega-mem vaults register <alias> [<path>]` (defaults to `~/.local/share/mega-mem/vaults/<alias>/`)
 - `--templates-dir` persistent flag prepends a directory to the search path
 
@@ -63,13 +66,17 @@ mega-mem does not ship a UI; it builds the layer that makes any UI work better. 
 
 - **`recall` tool** — Ollama HTTP client + sqlite-vec + background indexer + hybrid merge with ripgrep (lexical + semantic). Index lives at `<vault>/.mega-mem/index.sqlite`, gitignored by default but synced with the vault by Syncthing/Nextcloud/etc. so low-power machines (e.g., Raspberry Pi) can do recall against a pre-computed index without local embeddings. Users can exclude `.mega-mem/` from sync via the sync tool's ignore patterns if they want per-machine indexes.
 - **`list_tasks` tool** — regex over vault for Obsidian Tasks syntax (`- [ ] ... 📅 DATE`)
-- **Bridge / unbridge commands** — `mega-mem vault <ref> bridge|unbridge <harness> <scope>` per the CLI spec above. New `internal/bridge/` package implements per-harness logic.
+- **Bridge / unbridge commands** — `mega-mem agents bridge|unbridge <harness>` per the CLI spec above. `internal/bridge/` package implements per-harness logic; MCP wiring is the default action, memory bridging is opt-in via `--memory`.
 - **Hook recipes for Claude Code** (shipped as shell scripts under `share/mega-mem/hooks/claude-code/`):
-  - `UserPromptSubmit` — per-turn `recall` against the prompt; returns content as `additionalContext`. Additive to MEMORY.md (Claude Code loads that natively from the bridged vault subdir).
-  - `SessionStart` — load `rules/shared/` + `rules/claude-code-specific/` + `user/` as `additionalContext`.
+  - `UserPromptSubmit` — per-turn `recall` against the prompt; returns content as `additionalContext`.
+  - `SessionStart` — load `rules/` + `user/` as `additionalContext`.
 - **Hook recipes for Codex** (shipped under `share/mega-mem/hooks/codex/` plus a `hooks.json` snippet for `~/.codex/hooks.json`):
   - `UserPromptSubmit` — per-turn `recall`; same backend as Claude Code's hook. Codex command hooks inject via `hook_specific_output.additional_context` (parity with Claude Code).
-  - `SessionStart` — load `rules/shared/` + `rules/codex-specific/` + `user/`.
+  - `SessionStart` — load `rules/` + `user/`.
+- **Hook recipes for Hermes** (Python plugin under `share/mega-mem/hooks/hermes/`):
+  - `pre_llm_call` — per-turn `recall`; injected via `{"context": "..."}`.
+  - `on_session_start` — loads static context for observability.
+- **Per-harness hook toggle** — `mega-mem agents hooks {enable,disable} [<harness>]` writes `hooks: { <harness>: bool }` in `~/.config/mega-mem/state.yaml`. Hook scripts read the per-harness key at the top of each invocation; absent key = enabled (fail-open). Legacy v0.0.0 `hooks_enabled: <bool>` is migrated automatically on first write.
 - **`docs/SYNC-SUGGESTIONS.md`** — cross-machine recipes (Syncthing, VS Code Remote SSH, plain git push/pull, Tailscale + sshfs, conflict handling).
 - **GoReleaser config** — linux-amd64/arm64, darwin-amd64/arm64 tarballs + Homebrew tap + optional Docker image; Windows deferred
 - **Install script** — `curl -fsSL <url> | bash` for macOS + Linux, OS/arch auto-detect

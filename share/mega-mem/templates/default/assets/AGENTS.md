@@ -10,39 +10,34 @@ This vault is served by [mega-mem](https://github.com/herbslice/mega-mem) over M
 
 ## Layout
 
-- `agent-memory/` — harness-native memory, separated by source:
-  - `claude-code/<project-slug>/` — bridged from Claude Code's auto-memory dir
-  - `codex/<scope>/` — bridged from `~/.codex/memories/`
-  - `hermes/<scope>/` — bridged from `~/.hermes/memories/`
-  - `openclaw/<workspace>/` — bridged from `~/.openclaw/<workspace>/memory/` (just the daily journals — persona files like SOUL.md, IDENTITY.md, USER.md stay at their original paths)
-- `rules/` — agent-agnostic behavioral rules:
-  - `shared/` — cross-harness rules loaded by every agent
-  - `claude-code-specific/` — only for Claude Code sessions
-  - `codex-specific/` — only for Codex sessions
-- `user/` — cross-cutting personal context (profile, preferences, todos)
-- `orgs/` — one subfolder per organization (`infra/`, `projects/`, `decisions/`, `runbooks/`, `todos/`, `notes/`)
-- `orgs/shared/` — resources shared across multiple orgs
-- `reference/` — universal technical knowledge (`patterns/`, `tooling/`, `models/`)
-- `people/` — cross-org contacts
-- `inbox/` — fresh captures awaiting filing
+The default layout is intentionally flat — substructure is opt-in. The top-level folders that ship by default:
+
+- `agent-memory/` — harness-native memory, populated only when you run `mm agents bridge --memory <harness>`. Each bridged harness gets its own subtree (e.g., `agent-memory/claude-code/projects/`, `agent-memory/codex/memories/`). Empty until then.
+- `rules/` — cross-harness behavioral rules. Files here are loaded for every harness; organize by topic with your own subfolders if you want. (Audience-filtered rules are planned via frontmatter; until then, everything in `rules/` is universal.)
+- `user/` — cross-cutting personal context (profile, preferences, todos). No imposed substructure.
+- `orgs/` — one subfolder per organization. Apply the `org` template (`mm vault <alias> scaffold org orgs/foo`) for the canonical substructure: `infra/`, `projects/`, `decisions/`, `runbooks/`, `todos/`, `notes/`.
+- `projects/` — top-level projects for solo users who don't need multi-org segregation. Drop project notes here directly.
+- `tools/` — reference material on tools, libraries, languages, frameworks.
+- `reference/` — universal technical knowledge that doesn't fit `tools/`. File by topic.
+- `people/` — cross-org contacts.
+- `inbox/` — fresh captures awaiting filing.
 
 ## How harnesses see this vault
 
-Each harness reads its own subtree under `agent-memory/` plus cross-cutting content from `rules/shared/`, `rules/<harness>-specific/`, and `user/` injected at session start by a mega-mem hook. Audience filtering is achieved by directory layout — no `audience:` frontmatter required for the common cases.
+Each harness reads the vault contents through MCP `recall`. When `mm agents bridge --memory <harness>` is in effect, the harness's native memory directory lives inside this vault under `agent-memory/<harness>/`, so writes flow back here automatically. Cross-cutting context like `rules/` and `user/` is injected at session start by a mega-mem hook.
 
 ## TODOs
 
 Tasks live as Obsidian Tasks syntax inside notes:
 
-```
+```text
 - [ ] Something to do 📅 2026-04-30 ⏫
 ```
 
-Org-specific tasks go in `orgs/<org>/todos/`. Cross-cutting personal tasks go in `user/todos/`.
+Org-specific tasks go in `orgs/<org>/todos/`. Cross-cutting personal tasks go in `user/`. Project-specific tasks live alongside the project notes.
 
 ## What not to do
 
 - Do not raw-read large swaths of the vault to answer a question. Use `recall`.
-- Do not create new top-level folders without updating the vault template.
 - Do not put machine-specific paths in files that sync (e.g., `.mega-mem.yaml`). Those belong in the engine config at `~/.config/mega-mem/engines/`.
 - Do not write project guidance (architecture decisions, coding standards) into vault memory — that belongs in your project's own `AGENTS.md` / `CLAUDE.md` files, not here.

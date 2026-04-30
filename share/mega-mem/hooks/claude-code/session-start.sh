@@ -19,11 +19,31 @@
 
 set -euo pipefail
 
-# Honor the machine-local toggle written by `mega-mem hooks {enable,disable}`.
-# Absent file or absent field means hooks are enabled.
+# Honor the machine-local per-harness toggle written by
+# `mega-mem agents hooks {enable,disable} claude-code`. Absent file, absent
+# `hooks:` block, or absent harness key all mean enabled (fail-open).
 state_file="${XDG_CONFIG_HOME:-$HOME/.config}/mega-mem/state.yaml"
-if [[ -f "$state_file" ]] && grep -qE '^hooks_enabled:[[:space:]]*false[[:space:]]*$' "$state_file"; then
-  exit 0
+harness="claude-code"
+if [[ -f "$state_file" ]]; then
+  # v0.0.0 legacy: top-level `hooks_enabled: false` applies to all harnesses.
+  if grep -qE '^hooks_enabled:[[:space:]]*false[[:space:]]*$' "$state_file"; then
+    exit 0
+  fi
+  # v0.1.0+: scan the `hooks:` block for `<harness>: false`.
+  value=$(awk -v h="$harness" '
+    /^hooks:[[:space:]]*$/ { in_hooks=1; next }
+    /^[^[:space:]]/ && in_hooks { in_hooks=0 }
+    in_hooks && match($0, "^[[:space:]]+" h ":[[:space:]]*(true|false)[[:space:]]*$") {
+      val = substr($0, RSTART, RLENGTH)
+      sub("^[[:space:]]+" h ":[[:space:]]*", "", val)
+      sub("[[:space:]]*$", "", val)
+      print val
+      exit
+    }
+  ' "$state_file")
+  if [[ "$value" == "false" ]]; then
+    exit 0
+  fi
 fi
 
 vault="${MEGAMEM_VAULT_PATH:-}"

@@ -1,7 +1,8 @@
 name: rules
-description: Cross-harness behavioral rules. Per-harness subdirectories isolate guidance that only applies to one harness.
+description: Cross-harness behavioral rules. Markdown files at any depth; loaded for every harness.
 
-folders:
-  - shared
-  - claude-code-specific
-  - codex-specific
+# No default subfolders — rules are loaded universally. If you want
+# harness-targeted rules later, frontmatter-based audience filtering
+# is the planned mechanism (see FEATURES.md v1.x). Until then, organize
+# by topic with your own subfolders if you like.
+folders: []

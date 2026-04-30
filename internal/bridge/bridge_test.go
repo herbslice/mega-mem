@@ -34,9 +34,10 @@ func TestParseHarness(t *testing.T) {
 		"claude-code": {want: HarnessClaudeCode},
 		"codex":       {want: HarnessCodex},
 		"openclaw":    {want: HarnessOpenClaw},
+		"hermes":      {want: HarnessHermes},
 		"unknown":     {wantErr: true},
 		"":            {wantErr: true},
-		"Codex":       {wantErr: true}, // case-sensitive on purpose; lower-case canonical only
+		"Codex":       {wantErr: true},
 	}
 	for input, c := range cases {
 		got, err := ParseHarness(input)
@@ -56,17 +57,41 @@ func TestParseHarness(t *testing.T) {
 	}
 }
 
-func TestBridgeCodex_FreshSetup(t *testing.T) {
+// TestBridgeCodex_MemoryOptIn verifies the new MCP-only default: a bare
+// Bridge call only wires MCP, leaving ~/.codex/memories/ untouched.
+func TestBridgeCodex_MemoryOptIn(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		vault := t.TempDir()
-		res, err := Bridge(HarnessCodex, "personal", vault, Options{DryRun: false})
+		// Default options = MCP only.
+		if _, err := Bridge(HarnessCodex, vault, Options{DryRun: false}); err != nil {
+			t.Fatalf("Bridge: %v", err)
+		}
+		// No symlink should have been created.
+		link := filepath.Join(home, ".codex", "memories")
+		if _, err := os.Lstat(link); !os.IsNotExist(err) {
+			t.Errorf("default Bridge created %s; expected MCP-only", link)
+		}
+		// MCP config should exist.
+		if _, err := os.Stat(filepath.Join(home, ".codex", "config.toml")); err != nil {
+			t.Errorf("MCP config not written: %v", err)
+		}
+	})
+}
+
+func TestBridgeCodex_FreshSetupWithMemory(t *testing.T) {
+	withFakeHome(t, func(home string) {
+		vault := t.TempDir()
+		res, err := Bridge(HarnessCodex, vault, Options{
+			DryRun:        false,
+			Scope:         "personal",
+			IncludeMemory: true,
+		})
 		if err != nil {
 			t.Fatalf("Bridge: %v", err)
 		}
 		if res.Harness != HarnessCodex || res.Scope != "personal" {
 			t.Errorf("result harness/scope mismatch: %+v", res)
 		}
-		// Symlink should exist at ~/.codex/memories pointing into the vault.
 		link := filepath.Join(home, ".codex", "memories")
 		target, err := os.Readlink(link)
 		if err != nil {
@@ -82,6 +107,28 @@ func TestBridgeCodex_FreshSetup(t *testing.T) {
 	})
 }
 
+func TestBridgeCodex_DefaultScopeUsesMemoriesPath(t *testing.T) {
+	// Empty scope on a single-dir harness defaults to vault subdir "memories".
+	withFakeHome(t, func(home string) {
+		vault := t.TempDir()
+		if _, err := Bridge(HarnessCodex, vault, Options{
+			DryRun:        false,
+			IncludeMemory: true,
+		}); err != nil {
+			t.Fatalf("Bridge: %v", err)
+		}
+		link := filepath.Join(home, ".codex", "memories")
+		target, err := os.Readlink(link)
+		if err != nil {
+			t.Fatalf("readlink %s: %v", link, err)
+		}
+		want := filepath.Join(vault, "agent-memory", "codex", "memories")
+		if target != want {
+			t.Errorf("default-scope symlink target = %q, want %q", target, want)
+		}
+	})
+}
+
 func TestBridgeCodex_MigratesExistingFiles(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		vault := t.TempDir()
@@ -93,7 +140,11 @@ func TestBridgeCodex_MigratesExistingFiles(t *testing.T) {
 			t.Fatalf("write note: %v", err)
 		}
 
-		if _, err := Bridge(HarnessCodex, "personal", vault, Options{DryRun: false}); err != nil {
+		if _, err := Bridge(HarnessCodex, vault, Options{
+			DryRun:        false,
+			Scope:         "personal",
+			IncludeMemory: true,
+		}); err != nil {
 			t.Fatalf("Bridge: %v", err)
 		}
 
@@ -105,7 +156,6 @@ func TestBridgeCodex_MigratesExistingFiles(t *testing.T) {
 		if string(data) != "# test\n" {
 			t.Errorf("migrated content = %q, want %q", string(data), "# test\n")
 		}
-		// Source should be a symlink now, not the original directory.
 		if !isSymlink(src) {
 			t.Errorf("expected %s to be a symlink after bridge", src)
 		}
@@ -115,7 +165,11 @@ func TestBridgeCodex_MigratesExistingFiles(t *testing.T) {
 func TestBridgeCodex_DryRunNoChanges(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		vault := t.TempDir()
-		res, err := Bridge(HarnessCodex, "personal", vault, Options{DryRun: true})
+		res, err := Bridge(HarnessCodex, vault, Options{
+			DryRun:        true,
+			Scope:         "personal",
+			IncludeMemory: true,
+		})
 		if err != nil {
 			t.Fatalf("Bridge dry-run: %v", err)
 		}
@@ -125,7 +179,6 @@ func TestBridgeCodex_DryRunNoChanges(t *testing.T) {
 		if res.Executed != 0 {
 			t.Errorf("dry-run executed %d steps, want 0", res.Executed)
 		}
-		// No filesystem mutations should have happened.
 		link := filepath.Join(home, ".codex", "memories")
 		if _, err := os.Lstat(link); !os.IsNotExist(err) {
 			t.Errorf("dry-run created %s; expected no changes", link)
@@ -133,32 +186,57 @@ func TestBridgeCodex_DryRunNoChanges(t *testing.T) {
 	})
 }
 
-func TestBridgeClaudeCode_SetsAutoMemoryDirectory(t *testing.T) {
+// TestBridgeClaudeCode_MemoryDefaultMCPOnly confirms that without
+// IncludeMemory, no symlink touches ~/.claude/projects/.
+func TestBridgeClaudeCode_MemoryDefaultMCPOnly(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		vault := t.TempDir()
-		if _, err := Bridge(HarnessClaudeCode, "-tmp-fakeproject", vault, Options{DryRun: false}); err != nil {
+		if _, err := Bridge(HarnessClaudeCode, vault, Options{DryRun: false}); err != nil {
 			t.Fatalf("Bridge: %v", err)
 		}
-		settingsPath := filepath.Join(home, ".claude", "settings.json")
-		data, err := os.ReadFile(settingsPath)
+		projects := filepath.Join(home, ".claude", "projects")
+		if _, err := os.Lstat(projects); !os.IsNotExist(err) {
+			t.Errorf("default Bridge created %s; expected MCP-only", projects)
+		}
+		// MCP entry was added.
+		settings, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
 		if err != nil {
-			t.Fatalf("read settings: %v", err)
+			t.Fatalf("settings.json missing: %v", err)
 		}
-		var settings map[string]any
-		if err := json.Unmarshal(data, &settings); err != nil {
-			t.Fatalf("parse settings: %v", err)
-		}
-		got, ok := settings["autoMemoryDirectory"].(string)
-		if !ok {
-			t.Fatalf("autoMemoryDirectory not set in %s", settingsPath)
-		}
-		want := filepath.Join(vault, "agent-memory", "claude-code")
-		if got != want {
-			t.Errorf("autoMemoryDirectory = %q, want %q", got, want)
+		if !strings.Contains(string(settings), `"mega-mem"`) {
+			t.Errorf("mega-mem not in mcpServers: %s", settings)
 		}
 	})
 }
 
+// TestBridgeClaudeCode_MemorySymlinksProjects verifies that --memory with
+// no scope symlinks the whole ~/.claude/projects/ dir.
+func TestBridgeClaudeCode_MemorySymlinksProjects(t *testing.T) {
+	withFakeHome(t, func(home string) {
+		vault := t.TempDir()
+		if _, err := Bridge(HarnessClaudeCode, vault, Options{
+			DryRun:        false,
+			IncludeMemory: true,
+		}); err != nil {
+			t.Fatalf("Bridge: %v", err)
+		}
+		projects := filepath.Join(home, ".claude", "projects")
+		if !isSymlink(projects) {
+			t.Errorf("expected %s to be a symlink", projects)
+		}
+		target, err := os.Readlink(projects)
+		if err != nil {
+			t.Fatalf("readlink: %v", err)
+		}
+		want := filepath.Join(vault, "agent-memory", "claude-code", "projects")
+		if target != want {
+			t.Errorf("symlink target = %q, want %q", target, want)
+		}
+	})
+}
+
+// TestBridgeClaudeCode_PreservesOtherSettings verifies that bridging
+// preserves unrelated settings.json content (like statusLine).
 func TestBridgeClaudeCode_PreservesOtherSettings(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		settingsPath := filepath.Join(home, ".claude", "settings.json")
@@ -177,7 +255,7 @@ func TestBridgeClaudeCode_PreservesOtherSettings(t *testing.T) {
 		}
 
 		vault := t.TempDir()
-		if _, err := Bridge(HarnessClaudeCode, "-tmp-foo", vault, Options{DryRun: false}); err != nil {
+		if _, err := Bridge(HarnessClaudeCode, vault, Options{DryRun: false}); err != nil {
 			t.Fatalf("Bridge: %v", err)
 		}
 
@@ -196,8 +274,8 @@ func TestBridgeClaudeCode_PreservesOtherSettings(t *testing.T) {
 		if statusLine["command"] != "/path/to/statusline.sh" {
 			t.Errorf("statusLine clobbered: %+v", statusLine)
 		}
-		if _, ok := settings["autoMemoryDirectory"]; !ok {
-			t.Errorf("autoMemoryDirectory not added")
+		if _, ok := settings["mcpServers"]; !ok {
+			t.Errorf("mcpServers not added")
 		}
 	})
 }
@@ -205,22 +283,26 @@ func TestBridgeClaudeCode_PreservesOtherSettings(t *testing.T) {
 func TestUnbridgeCodex_RestoresFiles(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		vault := t.TempDir()
-		// Bridge first.
-		if _, err := Bridge(HarnessCodex, "personal", vault, Options{DryRun: false}); err != nil {
+		if _, err := Bridge(HarnessCodex, vault, Options{
+			DryRun:        false,
+			Scope:         "personal",
+			IncludeMemory: true,
+		}); err != nil {
 			t.Fatalf("setup bridge: %v", err)
 		}
-		// Add a file via the (now-symlinked) location, simulating Codex writing memory.
 		notePath := filepath.Join(home, ".codex", "memories", "after-bridge.md")
 		if err := os.WriteFile(notePath, []byte("# post\n"), 0o644); err != nil {
 			t.Fatalf("write through symlink: %v", err)
 		}
 
-		// Unbridge.
-		if _, err := Unbridge(HarnessCodex, "personal", vault, Options{DryRun: false}); err != nil {
+		if _, err := Unbridge(HarnessCodex, vault, Options{
+			DryRun:        false,
+			Scope:         "personal",
+			IncludeMemory: true,
+		}); err != nil {
 			t.Fatalf("Unbridge: %v", err)
 		}
 
-		// ~/.codex/memories should now be a real directory containing the file.
 		link := filepath.Join(home, ".codex", "memories")
 		if isSymlink(link) {
 			t.Errorf("expected %s to be a real directory after unbridge, still a symlink", link)
@@ -239,7 +321,6 @@ func TestBridgeRefusesConflictingExistingSymlink(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		vault := t.TempDir()
 		other := t.TempDir()
-		// Pre-create a symlink at ~/.codex/memories pointing somewhere else.
 		link := filepath.Join(home, ".codex", "memories")
 		if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
@@ -248,12 +329,57 @@ func TestBridgeRefusesConflictingExistingSymlink(t *testing.T) {
 			t.Fatalf("symlink: %v", err)
 		}
 
-		_, err := Bridge(HarnessCodex, "personal", vault, Options{DryRun: false})
+		_, err := Bridge(HarnessCodex, vault, Options{
+			DryRun:        false,
+			Scope:         "personal",
+			IncludeMemory: true,
+		})
 		if err == nil {
 			t.Errorf("expected error when symlink exists pointing elsewhere")
 		}
 		if err != nil && !strings.Contains(err.Error(), "already symlinked") {
 			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}
+
+// TestListClaudeScopes verifies project-slug enumeration works.
+func TestListClaudeScopes(t *testing.T) {
+	withFakeHome(t, func(home string) {
+		projects := filepath.Join(home, ".claude", "projects")
+		for _, slug := range []string{"-tmp-foo", "-tmp-bar", "-tmp-baz"} {
+			if err := os.MkdirAll(filepath.Join(projects, slug), 0o755); err != nil {
+				t.Fatalf("mkdir slug: %v", err)
+			}
+		}
+		got, err := listClaudeScopes()
+		if err != nil {
+			t.Fatalf("listClaudeScopes: %v", err)
+		}
+		if len(got) != 3 {
+			t.Errorf("got %d scopes, want 3: %v", len(got), got)
+		}
+	})
+}
+
+// TestListScopesViaBridge verifies the public ListScopes path returns
+// scopes without applying any steps.
+func TestListScopesViaBridge(t *testing.T) {
+	withFakeHome(t, func(home string) {
+		projects := filepath.Join(home, ".claude", "projects")
+		if err := os.MkdirAll(filepath.Join(projects, "-tmp-foo"), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		vault := t.TempDir()
+		res, err := Bridge(HarnessClaudeCode, vault, Options{ListScopes: true})
+		if err != nil {
+			t.Fatalf("Bridge --list-scopes: %v", err)
+		}
+		if len(res.Steps) != 0 {
+			t.Errorf("expected no steps in list-scopes mode, got %d", len(res.Steps))
+		}
+		if len(res.Scopes) == 0 {
+			t.Errorf("expected at least one scope, got none")
 		}
 	})
 }

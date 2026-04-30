@@ -1,14 +1,20 @@
 name: vault-root
 description: Top-level vault layout for a mega-mem vault.
 
+# Top-level dirs only. Substructure is opt-in: scaffold a sub-template
+# (e.g., `mm vault <alias> scaffold org orgs/foo`) when you want it.
+# `agent-memory/` is intentionally empty — `mm agents bridge --memory`
+# populates it per harness on first bridge.
 folders:
-  - agent-memory/{claude-code,codex,openclaw}
-  - orgs/{shared/infra}
-  - reference/{patterns,tooling,models}
-  - rules/{shared,claude-code-specific,codex-specific}
-  - user/{profile,preferences,todos}
-  - people
+  - agent-memory
   - inbox
+  - orgs
+  - people
+  - projects
+  - reference
+  - rules
+  - tools
+  - user
 
 files:
   - path: AGENTS.md

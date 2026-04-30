@@ -32,19 +32,39 @@ import urllib.parse
 import urllib.request
 
 
-def _toggle_disabled() -> bool:
-    """Return True if the machine-local mega-mem toggle is set to disabled."""
+def _toggle_disabled(harness: str = "hermes") -> bool:
+    """Return True if mega-mem's hooks are disabled for the named harness.
+
+    Honors both the v0.0.0 legacy global flag (`hooks_enabled: false`) and
+    the per-harness `hooks:` block (`hooks: { hermes: false }`). Absent file
+    or absent harness key returns False (fail-open: enabled).
+    """
     xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     state_file = os.path.join(xdg, "mega-mem", "state.yaml")
     try:
         with open(state_file, "r", encoding="utf-8") as f:
-            for line in f:
-                stripped = line.strip()
-                if stripped.startswith("hooks_enabled:"):
-                    value = stripped.split(":", 1)[1].strip()
-                    return value == "false"
+            text = f.read()
     except OSError:
-        pass
+        return False
+
+    # v0.0.0 legacy global flag.
+    for line in text.splitlines():
+        if line.strip() == "hooks_enabled: false":
+            return True
+
+    # v0.1.0+ per-harness flag: scan inside the `hooks:` block.
+    in_hooks = False
+    for line in text.splitlines():
+        if line.startswith("hooks:") and (line.rstrip() == "hooks:" or line[6:].strip() == ""):
+            in_hooks = True
+            continue
+        if in_hooks and line and not line[0].isspace():
+            in_hooks = False
+        if in_hooks:
+            stripped = line.lstrip()
+            if stripped.startswith(f"{harness}:"):
+                value = stripped.split(":", 1)[1].strip()
+                return value == "false"
     return False
 
 

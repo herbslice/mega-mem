@@ -1,7 +1,3 @@
 name: reference
-description: Cross-org universal technical knowledge.
-
-folders:
-  - patterns
-  - tooling
-  - models
+description: Cross-org universal technical knowledge. No imposed substructure — file by topic.
+folders: []

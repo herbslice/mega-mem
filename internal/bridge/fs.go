@@ -152,3 +152,23 @@ func removeIfEmpty(path string) error {
 	}
 	return os.Remove(path)
 }
+
+// listDirNames returns the names of immediate subdirectories of dir, sorted.
+// Missing dir returns nil, no error. Used by --list-scopes paths to enumerate
+// per-instance harnesses (Claude Code projects, OpenClaw workspaces, etc.).
+func listDirNames(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	return names, nil
+}

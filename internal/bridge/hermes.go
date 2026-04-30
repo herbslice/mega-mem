@@ -21,17 +21,24 @@ import (
 //
 // Hermes config (~/.hermes/config.yaml) supports a top-level mcp_servers
 // dict in the same shape as Claude Code's mcpServers. Bridge adds a
-// mega-mem entry pointing at the SSE URL.
+// mega-mem entry pointing at the SSE URL. Memory bridging is opt-in via
+// Options.IncludeMemory.
 
 const (
 	hermesMemoriesRel = ".hermes/memories"
 	hermesConfigRel   = ".hermes/config.yaml"
+	hermesDefaultPool = "memories"
 )
 
-func planBridgeHermes(scope, vaultRoot string, opts Options) (*Result, error) {
+// hermesVaultMem returns the vault subdir for a given scope.
+func hermesVaultMem(vaultRoot, scope string) string {
 	if scope == "" {
-		return nil, fmt.Errorf("hermes bridge requires a scope name (used as the vault subdir)")
+		scope = hermesDefaultPool
 	}
+	return filepath.Join(vaultRoot, "agent-memory", "hermes", scope)
+}
+
+func planBridgeHermes(vaultRoot string, opts Options) (*Result, error) {
 	home, err := homeDir()
 	if err != nil {
 		return nil, err
@@ -39,63 +46,16 @@ func planBridgeHermes(scope, vaultRoot string, opts Options) (*Result, error) {
 
 	defaultMem := filepath.Join(home, hermesMemoriesRel)
 	configPath := filepath.Join(home, hermesConfigRel)
-	vaultMem := vaultSubdir(vaultRoot, HarnessHermes, scope)
+	vaultMem := hermesVaultMem(vaultRoot, opts.Scope)
 
-	res := &Result{Harness: HarnessHermes, Scope: scope, DryRun: opts.DryRun}
+	res := &Result{Harness: HarnessHermes, Scope: opts.Scope, DryRun: opts.DryRun}
 
-	if !opts.SkipMemory {
-		if isSymlink(defaultMem) {
-			target, err := os.Readlink(defaultMem)
-			if err != nil {
-				return nil, fmt.Errorf("read existing symlink %s: %w", defaultMem, err)
-			}
-			if target != vaultMem {
-				return nil, fmt.Errorf("%s already symlinked to %s; remove it before bridging", defaultMem, target)
-			}
-			res.Steps = append(res.Steps, Step{
-				Kind:        "noop",
-				Description: fmt.Sprintf("%s already symlinked to %s — memory step skipped", defaultMem, vaultMem),
-			})
-		} else {
-			res.Steps = append(res.Steps, Step{
-				Kind:        "mkdir",
-				Description: fmt.Sprintf("ensure %s exists", vaultMem),
-				Apply: func() error {
-					return os.MkdirAll(vaultMem, 0o755)
-				},
-			})
-
-			if dirExists(defaultMem) && !isEmptyDir(defaultMem) {
-				res.Steps = append(res.Steps, Step{
-					Kind:        "copy",
-					Description: fmt.Sprintf("copy %s → %s", defaultMem, vaultMem),
-					Apply: func() error {
-						return copyTree(defaultMem, vaultMem)
-					},
-				})
-			}
-
-			if dirExists(defaultMem) {
-				res.Steps = append(res.Steps, Step{
-					Kind:        "rmdir",
-					Description: fmt.Sprintf("remove %s (after migration)", defaultMem),
-					Apply: func() error {
-						return os.RemoveAll(defaultMem)
-					},
-				})
-			}
-
-			res.Steps = append(res.Steps, Step{
-				Kind:        "symlink",
-				Description: fmt.Sprintf("symlink %s → %s", defaultMem, vaultMem),
-				Apply: func() error {
-					if err := os.MkdirAll(filepath.Dir(defaultMem), 0o755); err != nil {
-						return err
-					}
-					return os.Symlink(vaultMem, defaultMem)
-				},
-			})
+	if opts.IncludeMemory {
+		steps, err := codexMemorySteps(defaultMem, vaultMem) // identical pattern
+		if err != nil {
+			return nil, err
 		}
+		res.Steps = append(res.Steps, steps...)
 	}
 
 	if !opts.SkipMCP {
@@ -108,24 +68,13 @@ func planBridgeHermes(scope, vaultRoot string, opts Options) (*Result, error) {
 		})
 	}
 
-	if !opts.DryRun {
-		for _, st := range res.Steps {
-			if st.Apply == nil {
-				continue
-			}
-			if err := st.Apply(); err != nil {
-				return res, fmt.Errorf("%s: %w", st.Description, err)
-			}
-			res.Executed++
-		}
+	if err := applySteps(res, opts.DryRun); err != nil {
+		return res, err
 	}
 	return res, nil
 }
 
-func planUnbridgeHermes(scope, vaultRoot string, opts Options) (*Result, error) {
-	if scope == "" {
-		return nil, fmt.Errorf("hermes unbridge requires a scope name")
-	}
+func planUnbridgeHermes(vaultRoot string, opts Options) (*Result, error) {
 	home, err := homeDir()
 	if err != nil {
 		return nil, err
@@ -133,9 +82,9 @@ func planUnbridgeHermes(scope, vaultRoot string, opts Options) (*Result, error) 
 
 	defaultMem := filepath.Join(home, hermesMemoriesRel)
 	configPath := filepath.Join(home, hermesConfigRel)
-	vaultMem := vaultSubdir(vaultRoot, HarnessHermes, scope)
+	vaultMem := hermesVaultMem(vaultRoot, opts.Scope)
 
-	res := &Result{Harness: HarnessHermes, Scope: scope, DryRun: opts.DryRun}
+	res := &Result{Harness: HarnessHermes, Scope: opts.Scope, DryRun: opts.DryRun}
 
 	if !opts.SkipMCP {
 		res.Steps = append(res.Steps, Step{
@@ -147,7 +96,7 @@ func planUnbridgeHermes(scope, vaultRoot string, opts Options) (*Result, error) 
 		})
 	}
 
-	if !opts.SkipMemory {
+	if opts.IncludeMemory {
 		if isSymlink(defaultMem) {
 			target, err := os.Readlink(defaultMem)
 			if err != nil {
@@ -163,9 +112,7 @@ func planUnbridgeHermes(scope, vaultRoot string, opts Options) (*Result, error) 
 		res.Steps = append(res.Steps, Step{
 			Kind:        "unlink",
 			Description: fmt.Sprintf("remove symlink %s", defaultMem),
-			Apply: func() error {
-				return os.Remove(defaultMem)
-			},
+			Apply:       func() error { return os.Remove(defaultMem) },
 		})
 
 		if dirExists(vaultMem) {
@@ -185,23 +132,13 @@ func planUnbridgeHermes(scope, vaultRoot string, opts Options) (*Result, error) 
 			res.Steps = append(res.Steps, Step{
 				Kind:        "rmdir",
 				Description: fmt.Sprintf("remove %s (vault subtree; --keep-vault to preserve)", vaultMem),
-				Apply: func() error {
-					return os.RemoveAll(vaultMem)
-				},
+				Apply:       func() error { return os.RemoveAll(vaultMem) },
 			})
 		}
 	}
 
-	if !opts.DryRun {
-		for _, st := range res.Steps {
-			if st.Apply == nil {
-				continue
-			}
-			if err := st.Apply(); err != nil {
-				return res, fmt.Errorf("%s: %w", st.Description, err)
-			}
-			res.Executed++
-		}
+	if err := applySteps(res, opts.DryRun); err != nil {
+		return res, err
 	}
 	return res, nil
 }

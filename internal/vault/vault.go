@@ -17,16 +17,27 @@ import (
 type InitOpts struct {
 	Force        bool
 	DryRun       bool
-	RootTemplate string // default: "vault-root"
+	Scaffold     bool   // when true, also apply the root template (default: vault-root)
+	RootTemplate string // template name; non-empty implies Scaffold
 	TemplatesDir string // prepended to the template search path if non-empty
 	Git          bool   // run `git init` and write a starter .gitignore if the vault isn't already a git repo
 }
 
-// Init creates a new vault at path. If the directory exists and is empty, it
-// is used in place; if it exists and is non-empty, the run is refused unless
-// --force. The root template is applied and .mega-mem.yaml is written.
+// Init makes path a mega-mem vault. By default it writes only
+// .mega-mem.yaml (the marker file) — perfect for adopting an existing
+// directory like an Obsidian vault. Pass Scaffold=true (or set
+// RootTemplate explicitly) to also materialize the root template.
+//
+// If the directory exists and is non-empty, Init proceeds anyway: writes
+// the marker (guarded by --force if it already exists) and, when
+// scaffolding, relies on scaffold's idempotent semantics.
 func Init(path string, opts InitOpts) error {
-	if opts.RootTemplate == "" {
+	// An explicit RootTemplate implies Scaffold — if the user named a
+	// template, they want it applied.
+	if opts.RootTemplate != "" {
+		opts.Scaffold = true
+	}
+	if opts.Scaffold && opts.RootTemplate == "" {
 		opts.RootTemplate = "vault-root"
 	}
 
@@ -49,6 +60,37 @@ func Init(path string, opts InitOpts) error {
 		return fmt.Errorf("stat %s: %w", path, err)
 	}
 
+	if !opts.Scaffold {
+		return initConfigOnly(path, opts)
+	}
+
+	return initWithScaffold(path, opts)
+}
+
+// initConfigOnly writes .mega-mem.yaml (and optionally runs git init)
+// without applying any template. This is the default Init flow.
+func initConfigOnly(path string, opts InitOpts) error {
+	if opts.DryRun {
+		fmt.Println("(dry-run — would write .mega-mem.yaml)")
+		if opts.Git {
+			fmt.Println("(dry-run — would run 'git init' and write .gitignore)")
+		}
+		return nil
+	}
+	if err := writeVaultConfig(path, opts.Force); err != nil {
+		return err
+	}
+	if opts.Git {
+		if err := initGit(path, opts.Force); err != nil {
+			return fmt.Errorf("init git: %w", err)
+		}
+	}
+	fmt.Printf("Initialized vault at %s (config only — pass --scaffold to apply the default layout)\n", path)
+	return nil
+}
+
+// initWithScaffold writes .mega-mem.yaml and applies the root template.
+func initWithScaffold(path string, opts InitOpts) error {
 	extraDirs := []string{templates.VaultOverridesDir(path)}
 	if opts.TemplatesDir != "" {
 		extraDirs = append([]string{opts.TemplatesDir}, extraDirs...)
@@ -56,15 +98,7 @@ func Init(path string, opts InitOpts) error {
 	res := templates.NewResolver(extraDirs...)
 	tpl, err := res.Resolve(opts.RootTemplate)
 	if err != nil {
-		// No templates installed: init is still useful — create the path and
-		// write .mega-mem.yaml so scaffold can run later once templates exist.
-		if !opts.DryRun {
-			if err := writeVaultConfig(path, opts.Force); err != nil {
-				return err
-			}
-		}
-		fmt.Fprintf(os.Stderr, "note: no '%s' template resolved; created empty vault at %s\n", opts.RootTemplate, path)
-		return nil
+		return fmt.Errorf("resolve root template %q: %w", opts.RootTemplate, err)
 	}
 
 	plan, err := scaffold.Compute(res, tpl, path, scaffold.Options{Force: opts.Force})
@@ -83,11 +117,9 @@ func Init(path string, opts InitOpts) error {
 	if err := writeVaultConfig(path, opts.Force); err != nil {
 		return err
 	}
-
 	if err := scaffold.Apply(plan); err != nil {
 		return err
 	}
-
 	if opts.Git {
 		if err := initGit(path, opts.Force); err != nil {
 			return fmt.Errorf("init git: %w", err)

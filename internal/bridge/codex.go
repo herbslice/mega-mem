@@ -16,17 +16,27 @@ import (
 // inspection done while drafting this), so the only redirect mechanism is a
 // filesystem symlink at ~/.codex/memories/. Bridge migrates any existing
 // files into the vault and replaces the original directory with a symlink
-// pointing at the vault subtree.
+// pointing at the vault subtree. Memory bridging is opt-in via
+// Options.IncludeMemory; by default Bridge only wires the MCP server.
 
 const (
 	codexMemoriesRel = ".codex/memories"
 	codexConfigRel   = ".codex/config.toml"
+	codexDefaultPool = "memories"
 )
 
-func planBridgeCodex(scope, vaultRoot string, opts Options) (*Result, error) {
+// codexVaultMem returns the vault subdir for a given scope.
+//
+//	scope == ""   → <vault>/agent-memory/codex/memories/  (default pool)
+//	scope == "x"  → <vault>/agent-memory/codex/x/         (named pool)
+func codexVaultMem(vaultRoot, scope string) string {
 	if scope == "" {
-		return nil, fmt.Errorf("codex bridge requires a scope name (used as the vault subdir)")
+		scope = codexDefaultPool
 	}
+	return filepath.Join(vaultRoot, "agent-memory", "codex", scope)
+}
+
+func planBridgeCodex(vaultRoot string, opts Options) (*Result, error) {
 	home, err := homeDir()
 	if err != nil {
 		return nil, err
@@ -34,71 +44,16 @@ func planBridgeCodex(scope, vaultRoot string, opts Options) (*Result, error) {
 
 	defaultMem := filepath.Join(home, codexMemoriesRel)
 	configPath := filepath.Join(home, codexConfigRel)
-	vaultMem := vaultSubdir(vaultRoot, HarnessCodex, scope)
+	vaultMem := codexVaultMem(vaultRoot, opts.Scope)
 
-	res := &Result{Harness: HarnessCodex, Scope: scope, DryRun: opts.DryRun}
+	res := &Result{Harness: HarnessCodex, Scope: opts.Scope, DryRun: opts.DryRun}
 
-	if !opts.SkipMemory {
-		// Bail if the source path is already a symlink — assume it's already
-		// bridged (idempotent re-run is a no-op rather than an error, but warn
-		// if it points somewhere unexpected).
-		if isSymlink(defaultMem) {
-			target, err := os.Readlink(defaultMem)
-			if err != nil {
-				return nil, fmt.Errorf("read existing symlink %s: %w", defaultMem, err)
-			}
-			if target != vaultMem {
-				return nil, fmt.Errorf("%s already symlinked to %s; remove it before bridging", defaultMem, target)
-			}
-			res.Steps = append(res.Steps, Step{
-				Kind:        "noop",
-				Description: fmt.Sprintf("%s already symlinked to %s — memory step skipped", defaultMem, vaultMem),
-			})
-		} else {
-			// Step 1: ensure the vault subdirectory exists.
-			res.Steps = append(res.Steps, Step{
-				Kind:        "mkdir",
-				Description: fmt.Sprintf("ensure %s exists", vaultMem),
-				Apply: func() error {
-					return os.MkdirAll(vaultMem, 0o755)
-				},
-			})
-
-			// Step 2: migrate existing files into the vault.
-			if dirExists(defaultMem) && !isEmptyDir(defaultMem) {
-				res.Steps = append(res.Steps, Step{
-					Kind:        "copy",
-					Description: fmt.Sprintf("copy %s → %s", defaultMem, vaultMem),
-					Apply: func() error {
-						return copyTree(defaultMem, vaultMem)
-					},
-				})
-			}
-
-			// Step 3: remove the original directory (must be empty after migration
-			// so we don't accidentally drop user data).
-			if dirExists(defaultMem) {
-				res.Steps = append(res.Steps, Step{
-					Kind:        "rmdir",
-					Description: fmt.Sprintf("remove %s (after migration)", defaultMem),
-					Apply: func() error {
-						return os.RemoveAll(defaultMem)
-					},
-				})
-			}
-
-			// Step 4: place the symlink.
-			res.Steps = append(res.Steps, Step{
-				Kind:        "symlink",
-				Description: fmt.Sprintf("symlink %s → %s", defaultMem, vaultMem),
-				Apply: func() error {
-					if err := os.MkdirAll(filepath.Dir(defaultMem), 0o755); err != nil {
-						return err
-					}
-					return os.Symlink(vaultMem, defaultMem)
-				},
-			})
+	if opts.IncludeMemory {
+		steps, err := codexMemorySteps(defaultMem, vaultMem)
+		if err != nil {
+			return nil, err
 		}
+		res.Steps = append(res.Steps, steps...)
 	}
 
 	if !opts.SkipMCP {
@@ -111,24 +66,66 @@ func planBridgeCodex(scope, vaultRoot string, opts Options) (*Result, error) {
 		})
 	}
 
-	if !opts.DryRun {
-		for _, st := range res.Steps {
-			if st.Apply == nil {
-				continue
-			}
-			if err := st.Apply(); err != nil {
-				return res, fmt.Errorf("%s: %w", st.Description, err)
-			}
-			res.Executed++
-		}
+	if err := applySteps(res, opts.DryRun); err != nil {
+		return res, err
 	}
 	return res, nil
 }
 
-func planUnbridgeCodex(scope, vaultRoot string, opts Options) (*Result, error) {
-	if scope == "" {
-		return nil, fmt.Errorf("codex unbridge requires a scope name")
+// codexMemorySteps builds the symlink-replace plan for Codex's single
+// memories/ directory. Idempotent: if defaultMem is already a symlink to
+// vaultMem, returns a single noop step.
+func codexMemorySteps(defaultMem, vaultMem string) ([]Step, error) {
+	var steps []Step
+	if isSymlink(defaultMem) {
+		target, err := os.Readlink(defaultMem)
+		if err != nil {
+			return nil, fmt.Errorf("read existing symlink %s: %w", defaultMem, err)
+		}
+		if target != vaultMem {
+			return nil, fmt.Errorf("%s already symlinked to %s; remove it before bridging", defaultMem, target)
+		}
+		steps = append(steps, Step{
+			Kind:        "noop",
+			Description: fmt.Sprintf("%s already symlinked to %s — memory step skipped", defaultMem, vaultMem),
+		})
+		return steps, nil
 	}
+
+	steps = append(steps, Step{
+		Kind:        "mkdir",
+		Description: fmt.Sprintf("ensure %s exists", vaultMem),
+		Apply:       func() error { return os.MkdirAll(vaultMem, 0o755) },
+	})
+
+	if dirExists(defaultMem) && !isEmptyDir(defaultMem) {
+		steps = append(steps, Step{
+			Kind:        "copy",
+			Description: fmt.Sprintf("copy %s → %s", defaultMem, vaultMem),
+			Apply:       func() error { return copyTree(defaultMem, vaultMem) },
+		})
+	}
+	if dirExists(defaultMem) {
+		steps = append(steps, Step{
+			Kind:        "rmdir",
+			Description: fmt.Sprintf("remove %s (after migration)", defaultMem),
+			Apply:       func() error { return os.RemoveAll(defaultMem) },
+		})
+	}
+	steps = append(steps, Step{
+		Kind:        "symlink",
+		Description: fmt.Sprintf("symlink %s → %s", defaultMem, vaultMem),
+		Apply: func() error {
+			if err := os.MkdirAll(filepath.Dir(defaultMem), 0o755); err != nil {
+				return err
+			}
+			return os.Symlink(vaultMem, defaultMem)
+		},
+	})
+	return steps, nil
+}
+
+func planUnbridgeCodex(vaultRoot string, opts Options) (*Result, error) {
 	home, err := homeDir()
 	if err != nil {
 		return nil, err
@@ -136,9 +133,9 @@ func planUnbridgeCodex(scope, vaultRoot string, opts Options) (*Result, error) {
 
 	defaultMem := filepath.Join(home, codexMemoriesRel)
 	configPath := filepath.Join(home, codexConfigRel)
-	vaultMem := vaultSubdir(vaultRoot, HarnessCodex, scope)
+	vaultMem := codexVaultMem(vaultRoot, opts.Scope)
 
-	res := &Result{Harness: HarnessCodex, Scope: scope, DryRun: opts.DryRun}
+	res := &Result{Harness: HarnessCodex, Scope: opts.Scope, DryRun: opts.DryRun}
 
 	if !opts.SkipMCP {
 		res.Steps = append(res.Steps, Step{
@@ -150,8 +147,7 @@ func planUnbridgeCodex(scope, vaultRoot string, opts Options) (*Result, error) {
 		})
 	}
 
-	if !opts.SkipMemory {
-		// Verify the symlink points where we expect; refuse to act otherwise.
+	if opts.IncludeMemory {
 		if isSymlink(defaultMem) {
 			target, err := os.Readlink(defaultMem)
 			if err != nil {
@@ -164,16 +160,12 @@ func planUnbridgeCodex(scope, vaultRoot string, opts Options) (*Result, error) {
 			return nil, fmt.Errorf("%s is a real directory (not a symlink); nothing to unbridge", defaultMem)
 		}
 
-		// Remove the symlink.
 		res.Steps = append(res.Steps, Step{
 			Kind:        "unlink",
 			Description: fmt.Sprintf("remove symlink %s", defaultMem),
-			Apply: func() error {
-				return os.Remove(defaultMem)
-			},
+			Apply:       func() error { return os.Remove(defaultMem) },
 		})
 
-		// Copy vault content back to default location.
 		if dirExists(vaultMem) {
 			res.Steps = append(res.Steps, Step{
 				Kind:        "copy",
@@ -187,28 +179,17 @@ func planUnbridgeCodex(scope, vaultRoot string, opts Options) (*Result, error) {
 			})
 		}
 
-		// Optionally remove the vault subtree.
 		if !opts.KeepVault {
 			res.Steps = append(res.Steps, Step{
 				Kind:        "rmdir",
 				Description: fmt.Sprintf("remove %s (vault subtree; --keep-vault to preserve)", vaultMem),
-				Apply: func() error {
-					return os.RemoveAll(vaultMem)
-				},
+				Apply:       func() error { return os.RemoveAll(vaultMem) },
 			})
 		}
 	}
 
-	if !opts.DryRun {
-		for _, st := range res.Steps {
-			if st.Apply == nil {
-				continue
-			}
-			if err := st.Apply(); err != nil {
-				return res, fmt.Errorf("%s: %w", st.Description, err)
-			}
-			res.Executed++
-		}
+	if err := applySteps(res, opts.DryRun); err != nil {
+		return res, err
 	}
 	return res, nil
 }
@@ -232,7 +213,6 @@ func setCodexMCPServer(configPath, name, url string) error {
 
 	rest, hadSection := excludeTomlSection(string(existing), header)
 	if hadSection && strings.Contains(string(existing), body) {
-		// Already in the desired state — nothing to do.
 		return nil
 	}
 
@@ -303,8 +283,6 @@ func excludeTomlSection(input, header string) (string, bool) {
 			out.WriteByte('\n')
 		}
 	}
-	// Best-effort error swallow on read; we already have what we processed.
 	_ = scanner.Err()
 	return out.String(), found
 }
-

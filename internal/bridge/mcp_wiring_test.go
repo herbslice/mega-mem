@@ -8,12 +8,12 @@ import (
 	"testing"
 )
 
-// TestBridgeClaudeCode_AddsMCPServer verifies that a full bridge wires
-// both autoMemoryDirectory and mcpServers["mega-mem"] in settings.json.
+// TestBridgeClaudeCode_AddsMCPServer verifies the default (MCP-only)
+// bridge wires mcpServers["mega-mem"] in settings.json.
 func TestBridgeClaudeCode_AddsMCPServer(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		vault := t.TempDir()
-		if _, err := Bridge(HarnessClaudeCode, "-tmp-foo", vault, Options{DryRun: false}); err != nil {
+		if _, err := Bridge(HarnessClaudeCode, vault, Options{DryRun: false}); err != nil {
 			t.Fatalf("Bridge: %v", err)
 		}
 
@@ -59,7 +59,7 @@ func TestBridgeClaudeCode_PreservesOtherMCPServers(t *testing.T) {
 		}
 
 		vault := t.TempDir()
-		if _, err := Bridge(HarnessClaudeCode, "-tmp-foo", vault, Options{DryRun: false}); err != nil {
+		if _, err := Bridge(HarnessClaudeCode, vault, Options{DryRun: false}); err != nil {
 			t.Fatalf("Bridge: %v", err)
 		}
 
@@ -79,7 +79,7 @@ func TestBridgeClaudeCode_PreservesOtherMCPServers(t *testing.T) {
 func TestBridgeCodex_AddsMCPSection(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		vault := t.TempDir()
-		if _, err := Bridge(HarnessCodex, "personal", vault, Options{DryRun: false}); err != nil {
+		if _, err := Bridge(HarnessCodex, vault, Options{DryRun: false}); err != nil {
 			t.Fatalf("Bridge: %v", err)
 		}
 		configPath := filepath.Join(home, ".codex", "config.toml")
@@ -113,7 +113,7 @@ trust_level = "trusted"
 		}
 
 		vault := t.TempDir()
-		if _, err := Bridge(HarnessCodex, "personal", vault, Options{DryRun: false}); err != nil {
+		if _, err := Bridge(HarnessCodex, vault, Options{DryRun: false}); err != nil {
 			t.Fatalf("Bridge: %v", err)
 		}
 
@@ -122,7 +122,6 @@ trust_level = "trusted"
 			t.Fatalf("read config: %v", err)
 		}
 		body := string(data)
-		// Original lines preserved.
 		for _, line := range []string{
 			`model = "gpt-5.5"`,
 			`model_reasoning_effort = "xhigh"`,
@@ -133,7 +132,6 @@ trust_level = "trusted"
 				t.Errorf("original line lost after MCP add: %q\nbody:\n%s", line, body)
 			}
 		}
-		// New section appended.
 		if !strings.Contains(body, "[mcp_servers.mega-mem]") {
 			t.Errorf("mcp_servers section not appended: %s", body)
 		}
@@ -160,22 +158,9 @@ url = "http://localhost:9999/sse"
 			t.Fatalf("seed config: %v", err)
 		}
 
-		// Set up matching memory state for unbridge.
-		memSrc := filepath.Join(home, ".codex", "memories")
-		if err := os.MkdirAll(memSrc, 0o755); err != nil {
-			t.Fatalf("mkdir memories: %v", err)
-		}
-		// Unbridge requires a symlink — make one pointing to a fake vault path.
+		// MCP-only unbridge — no IncludeMemory, so symlink path is skipped.
 		fakeVault := t.TempDir()
-		os.RemoveAll(memSrc)
-		if err := os.Symlink(filepath.Join(fakeVault, "agent-memory", "codex", "personal"), memSrc); err != nil {
-			t.Fatalf("symlink: %v", err)
-		}
-		if err := os.MkdirAll(filepath.Join(fakeVault, "agent-memory", "codex", "personal"), 0o755); err != nil {
-			t.Fatalf("mkdir target: %v", err)
-		}
-
-		if _, err := Unbridge(HarnessCodex, "personal", fakeVault, Options{DryRun: false}); err != nil {
+		if _, err := Unbridge(HarnessCodex, fakeVault, Options{DryRun: false}); err != nil {
 			t.Fatalf("Unbridge: %v", err)
 		}
 
@@ -187,11 +172,9 @@ url = "http://localhost:9999/sse"
 		if strings.Contains(body, "[mcp_servers.mega-mem]") {
 			t.Errorf("[mcp_servers.mega-mem] still present after unbridge: %s", body)
 		}
-		// Other section retained.
 		if !strings.Contains(body, "[mcp_servers.other]") {
 			t.Errorf("[mcp_servers.other] removed (should be preserved): %s", body)
 		}
-		// Top-level keys retained.
 		if !strings.Contains(body, `model = "gpt-5.5"`) {
 			t.Errorf("model key lost: %s", body)
 		}
@@ -201,9 +184,7 @@ url = "http://localhost:9999/sse"
 func TestBridgeOpenClaw_AddsMCPServer(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		vault := t.TempDir()
-		// OpenClaw bridge requires a workspace dir to migrate or the bridge
-		// will simply skip the migration step. The MCP step still runs.
-		if _, err := Bridge(HarnessOpenClaw, "workspace-test", vault, Options{DryRun: false}); err != nil {
+		if _, err := Bridge(HarnessOpenClaw, vault, Options{DryRun: false}); err != nil {
 			t.Fatalf("Bridge: %v", err)
 		}
 
@@ -237,48 +218,58 @@ func TestBridgeOpenClaw_AddsMCPServer(t *testing.T) {
 	})
 }
 
-func TestBridge_NoMCPSkipsConfig(t *testing.T) {
+// TestBridge_SkipMCPOnlyMemory verifies --memory + --no-mcp produces
+// memory bridge only.
+func TestBridge_SkipMCPOnlyMemory(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		vault := t.TempDir()
-		_, err := Bridge(HarnessClaudeCode, "-tmp-foo", vault, Options{DryRun: false, SkipMCP: true})
+		_, err := Bridge(HarnessClaudeCode, vault, Options{
+			DryRun:        false,
+			IncludeMemory: true,
+			SkipMCP:       true,
+		})
 		if err != nil {
 			t.Fatalf("Bridge: %v", err)
 		}
-		data, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
-		if err != nil {
-			t.Fatalf("read settings: %v", err)
+		settingsPath := filepath.Join(home, ".claude", "settings.json")
+		if data, err := os.ReadFile(settingsPath); err == nil {
+			var settings map[string]any
+			_ = json.Unmarshal(data, &settings)
+			if _, ok := settings["mcpServers"]; ok {
+				t.Errorf("mcpServers added despite SkipMCP=true: %+v", settings)
+			}
 		}
-		var settings map[string]any
-		_ = json.Unmarshal(data, &settings)
-		if _, ok := settings["mcpServers"]; ok {
-			t.Errorf("mcpServers added despite SkipMCP=true: %+v", settings)
-		}
-		// autoMemoryDirectory still set (memory step ran).
-		if _, ok := settings["autoMemoryDirectory"]; !ok {
-			t.Errorf("autoMemoryDirectory missing: %+v", settings)
+		// Memory symlink should exist.
+		projects := filepath.Join(home, ".claude", "projects")
+		if !isSymlink(projects) {
+			t.Errorf("expected projects symlink with --memory --no-mcp")
 		}
 	})
 }
 
-func TestBridge_NoMemorySkipsRedirect(t *testing.T) {
+// TestBridge_DefaultIsMCPOnly verifies the new ergonomic default: bare
+// Bridge() only wires MCP, no filesystem moves.
+func TestBridge_DefaultIsMCPOnly(t *testing.T) {
 	withFakeHome(t, func(home string) {
 		vault := t.TempDir()
-		_, err := Bridge(HarnessClaudeCode, "-tmp-foo", vault, Options{DryRun: false, SkipMemory: true})
+		_, err := Bridge(HarnessClaudeCode, vault, Options{DryRun: false})
 		if err != nil {
 			t.Fatalf("Bridge: %v", err)
 		}
-		data, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
+		// MCP wired.
+		settingsPath := filepath.Join(home, ".claude", "settings.json")
+		data, err := os.ReadFile(settingsPath)
 		if err != nil {
 			t.Fatalf("read settings: %v", err)
 		}
 		var settings map[string]any
 		_ = json.Unmarshal(data, &settings)
-		if _, ok := settings["autoMemoryDirectory"]; ok {
-			t.Errorf("autoMemoryDirectory set despite SkipMemory=true: %+v", settings)
-		}
-		// MCP added still.
 		if _, ok := settings["mcpServers"]; !ok {
-			t.Errorf("mcpServers missing despite SkipMemory only: %+v", settings)
+			t.Errorf("mcpServers missing in default mode: %+v", settings)
+		}
+		// No filesystem moves.
+		if _, err := os.Lstat(filepath.Join(home, ".claude", "projects")); !os.IsNotExist(err) {
+			t.Errorf("projects symlink/dir created in default mode")
 		}
 	})
 }

@@ -1,19 +1,21 @@
 // Package bridge wires harness-native memory directories into a mega-mem vault.
 //
-// Three harnesses are supported in v1:
+// Four harnesses are supported in v1:
 //
-//   - Claude Code: redirected via the `autoMemoryDirectory` setting in
-//     ~/.claude/settings.json. Per-project memory dirs land under the vault
-//     automatically once the redirect is in place.
+//   - Claude Code: ~/.claude/projects/ symlinked into the vault when
+//     IncludeMemory is set; without it, the bridge only adds mega-mem to
+//     ~/.claude/settings.json's mcpServers map.
 //
-//   - Codex: redirected via a filesystem symlink at ~/.codex/memories/, since
-//     Codex has no equivalent settings knob.
+//   - Codex / Hermes: single-directory harnesses; ~/.codex/memories/ and
+//     ~/.hermes/memories/ are symlink-replaced into the vault.
 //
-//   - OpenClaw: redirected via the `agents.defaults.workspace` field in
-//     ~/.openclaw/openclaw.json.
+//   - OpenClaw: per-workspace symlink-replace at ~/.openclaw/<ws>/memory/.
+//     With IncludeMemory and no Scope, every workspace is bridged; pass
+//     Scope to filter to one workspace.
 //
 // All bridge operations are dry-run-by-default. Apply only writes to disk
-// when DryRun is false.
+// when DryRun is false. Memory bridging is opt-in (IncludeMemory=true) —
+// by default Bridge only wires the MCP server.
 package bridge
 
 import (
@@ -52,22 +54,37 @@ func ParseHarness(s string) (Harness, error) {
 type Options struct {
 	// DryRun reports the steps that would run without writing anything.
 	DryRun bool
-	// KeepVault, on Unbridge, leaves the vault subtree intact after copying
-	// content back to the harness's default location. Defaults to true to
-	// avoid surprising data loss.
-	KeepVault bool
-	// SkipMemory disables the memory-redirect half of bridge/unbridge.
-	// Useful when you only want to wire (or unwire) the MCP server and
-	// already have memory bridged or want to manage it separately.
-	SkipMemory bool
-	// SkipMCP disables the MCP-server-wiring half of bridge/unbridge.
-	// Useful when you don't run mega-mem's MCP server (e.g., you prefer
-	// hook-only injection) or want to wire MCP later by hand.
+
+	// Scope optionally narrows the bridge. Empty = harness-defined default
+	// (Claude Code: whole projects/ dir; OpenClaw: all workspaces;
+	// Codex/Hermes: single "memories" subdir). Non-empty = a specific
+	// workspace/slug/named pool.
+	Scope string
+
+	// IncludeMemory enables the filesystem-moving memory bridge. Default
+	// false: Bridge only wires the MCP server. When true, the per-harness
+	// memory mechanism runs (symlink-replace in most cases).
+	IncludeMemory bool
+
+	// SkipMCP disables the MCP-config wiring. Default false. Combined with
+	// !IncludeMemory makes Bridge a no-op.
 	SkipMCP bool
-	// MCPURL is the SSE endpoint for mega-mem's MCP server, written into
-	// each harness's MCP config. Defaults to the engine's bind address
-	// when empty (the caller is expected to fill this in).
+
+	// KeepVault, on Unbridge, leaves the vault subtree intact after copying
+	// content back to the harness's default location. Defaults to false:
+	// unbridge cleans up its target.
+	KeepVault bool
+
+	// MCPURL is the SSE endpoint mega-mem's MCP server exposes. Defaults
+	// to DefaultMCPURL when empty.
 	MCPURL string
+
+	// ListScopes, when set on Bridge(), short-circuits the planning: returns
+	// a Result with no Apply steps but with Scopes populated, listing the
+	// names a user could pass as Scope. Definition of "scope" depends on
+	// the harness (CC: project slug; OpenClaw: workspace name; Codex/Hermes:
+	// existing vault subdir name).
+	ListScopes bool
 }
 
 // Step describes one filesystem or config mutation in a bridge plan.
@@ -89,6 +106,10 @@ type Result struct {
 	DryRun   bool
 	Steps    []Step
 	Executed int
+
+	// Scopes is populated by Bridge when ListScopes is true, listing
+	// discoverable scope names for this harness.
+	Scopes []string
 }
 
 // DefaultMCPURL is the SSE endpoint mega-mem's MCP server exposes when the
@@ -96,10 +117,37 @@ type Result struct {
 // harness's MCP config when Options.MCPURL is empty.
 const DefaultMCPURL = "http://127.0.0.1:8111/sse"
 
-// Bridge wires the harness's memory store into the vault under
-// agent-memory/<harness>/<scope>/. The exact mechanism depends on the harness:
-// see the package doc comment.
-func Bridge(harness Harness, scope, vaultRoot string, opts Options) (*Result, error) {
+// Bridge wires the harness's MCP server into its config and (when
+// opts.IncludeMemory) redirects its memory directory into the vault.
+func Bridge(harness Harness, vaultRoot string, opts Options) (*Result, error) {
+	vaultRoot, err := filepath.Abs(vaultRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve vault root: %w", err)
+	}
+	if opts.MCPURL == "" {
+		opts.MCPURL = DefaultMCPURL
+	}
+	if opts.ListScopes {
+		return planListScopes(harness, vaultRoot)
+	}
+	switch harness {
+	case HarnessClaudeCode:
+		return planBridgeClaudeCode(vaultRoot, opts)
+	case HarnessCodex:
+		return planBridgeCodex(vaultRoot, opts)
+	case HarnessOpenClaw:
+		return planBridgeOpenClaw(vaultRoot, opts)
+	case HarnessHermes:
+		return planBridgeHermes(vaultRoot, opts)
+	default:
+		return nil, fmt.Errorf("unsupported harness %q", harness)
+	}
+}
+
+// Unbridge reverses a Bridge: removes the MCP entry and (when
+// opts.IncludeMemory) the memory redirect, copying content back to the
+// harness's default location.
+func Unbridge(harness Harness, vaultRoot string, opts Options) (*Result, error) {
 	vaultRoot, err := filepath.Abs(vaultRoot)
 	if err != nil {
 		return nil, fmt.Errorf("resolve vault root: %w", err)
@@ -109,44 +157,69 @@ func Bridge(harness Harness, scope, vaultRoot string, opts Options) (*Result, er
 	}
 	switch harness {
 	case HarnessClaudeCode:
-		return planBridgeClaudeCode(scope, vaultRoot, opts)
+		return planUnbridgeClaudeCode(vaultRoot, opts)
 	case HarnessCodex:
-		return planBridgeCodex(scope, vaultRoot, opts)
+		return planUnbridgeCodex(vaultRoot, opts)
 	case HarnessOpenClaw:
-		return planBridgeOpenClaw(scope, vaultRoot, opts)
+		return planUnbridgeOpenClaw(vaultRoot, opts)
 	case HarnessHermes:
-		return planBridgeHermes(scope, vaultRoot, opts)
+		return planUnbridgeHermes(vaultRoot, opts)
 	default:
 		return nil, fmt.Errorf("unsupported harness %q", harness)
 	}
 }
 
-// Unbridge reverses a Bridge: copies vault content back to the harness's
-// default location and removes the redirect (config edit or symlink).
-func Unbridge(harness Harness, scope, vaultRoot string, opts Options) (*Result, error) {
-	vaultRoot, err := filepath.Abs(vaultRoot)
-	if err != nil {
-		return nil, fmt.Errorf("resolve vault root: %w", err)
-	}
-	if opts.MCPURL == "" {
-		opts.MCPURL = DefaultMCPURL
-	}
+// planListScopes dispatches to the per-harness scope enumerator.
+func planListScopes(harness Harness, vaultRoot string) (*Result, error) {
+	res := &Result{Harness: harness, DryRun: true}
+	var scopes []string
+	var err error
 	switch harness {
 	case HarnessClaudeCode:
-		return planUnbridgeClaudeCode(scope, vaultRoot, opts)
+		scopes, err = listClaudeScopes()
 	case HarnessCodex:
-		return planUnbridgeCodex(scope, vaultRoot, opts)
-	case HarnessOpenClaw:
-		return planUnbridgeOpenClaw(scope, vaultRoot, opts)
+		scopes, err = listVaultScopes(vaultRoot, HarnessCodex)
 	case HarnessHermes:
-		return planUnbridgeHermes(scope, vaultRoot, opts)
+		scopes, err = listVaultScopes(vaultRoot, HarnessHermes)
+	case HarnessOpenClaw:
+		scopes, err = listOpenClawScopes()
 	default:
 		return nil, fmt.Errorf("unsupported harness %q", harness)
 	}
+	if err != nil {
+		return nil, err
+	}
+	res.Scopes = scopes
+	return res, nil
 }
 
-// vaultSubdir returns the vault path for a (harness, scope) pair:
-// <vaultRoot>/agent-memory/<harness>/<scope>/.
-func vaultSubdir(vaultRoot string, harness Harness, scope string) string {
-	return filepath.Join(vaultRoot, "agent-memory", string(harness), scope)
+// applySteps runs each step's Apply unless DryRun. Stops on first error
+// and returns the executed count so far.
+func applySteps(res *Result, dryRun bool) error {
+	if dryRun {
+		return nil
+	}
+	for _, st := range res.Steps {
+		if st.Apply == nil {
+			continue
+		}
+		if err := st.Apply(); err != nil {
+			return fmt.Errorf("%s: %w", st.Description, err)
+		}
+		res.Executed++
+	}
+	return nil
+}
+
+// listVaultScopes returns the directory names directly under
+// <vaultRoot>/agent-memory/<harness>/. Used for the Codex / Hermes
+// --list-scopes path: those harnesses have user-named pools and there's no
+// other discovery channel beyond inspecting what already exists in the
+// vault.
+func listVaultScopes(vaultRoot string, harness Harness) ([]string, error) {
+	root := filepath.Join(vaultRoot, "agent-memory", string(harness))
+	if !dirExists(root) {
+		return nil, nil
+	}
+	return listDirNames(root)
 }

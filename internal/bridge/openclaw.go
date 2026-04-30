@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 )
 
-// OpenClaw memory layout (per the active install on this machine):
+// OpenClaw memory layout:
 //
 //   ~/.openclaw/<workspace>/                <- workspace markdown + state
 //     IDENTITY.md, SOUL.md, USER.md, ...    <- persona + project guidance
@@ -15,87 +15,55 @@ import (
 //     state/, skills/, scripts/, ...        <- runtime state
 //   ~/.openclaw/memory/<agent>.sqlite       <- index over the markdown
 //
-// The bridge is intentionally narrow: only the memory/ subdirectory is
-// redirected into the vault. Persona files (SOUL.md, IDENTITY.md, etc.),
-// project guidance (AGENTS.md), and runtime state stay at their original
-// paths under ~/.openclaw/<workspace>/. Cross-machine portability for
-// those is out of scope — see docs/SYNC-SUGGESTIONS.md for how to handle
-// them with Syncthing or similar if desired.
+// The bridge is intentionally narrow: only the memory/ subdirectory of each
+// workspace is redirected into the vault. Persona files (SOUL.md,
+// IDENTITY.md, etc.), project guidance (AGENTS.md), and runtime state stay
+// at their original paths under ~/.openclaw/<workspace>/.
 //
-// MCP wiring is independent: bridge adds mega-mem to mcp.servers in
-// ~/.openclaw/openclaw.json regardless of memory bridging.
+// Multi-workspace fan-out: when Options.IncludeMemory is set with empty
+// Scope, every workspace under ~/.openclaw/ is bridged. With a Scope,
+// only that workspace is bridged. MCP wiring is independent and applies
+// regardless of memory bridging.
 
 const (
 	openclawConfigRel = ".openclaw/openclaw.json"
+	openclawHomeRel   = ".openclaw"
 )
 
-func planBridgeOpenClaw(scope, vaultRoot string, opts Options) (*Result, error) {
-	if scope == "" {
-		return nil, fmt.Errorf("openclaw bridge requires a workspace name")
-	}
+// openclawVaultMem returns the vault subdir for a given workspace.
+//
+//	<vault>/agent-memory/openclaw/<workspace>/
+func openclawVaultMem(vaultRoot, workspace string) string {
+	return filepath.Join(vaultRoot, "agent-memory", "openclaw", workspace)
+}
+
+// openclawWorkspaceMem returns the source memory dir for a workspace.
+func openclawWorkspaceMem(home, workspace string) string {
+	return filepath.Join(home, openclawHomeRel, workspace, "memory")
+}
+
+func planBridgeOpenClaw(vaultRoot string, opts Options) (*Result, error) {
 	home, err := homeDir()
 	if err != nil {
 		return nil, err
 	}
 
 	configPath := filepath.Join(home, openclawConfigRel)
-	defaultMem := filepath.Join(home, ".openclaw", scope, "memory")
-	vaultMem := vaultSubdir(vaultRoot, HarnessOpenClaw, scope)
+	res := &Result{Harness: HarnessOpenClaw, Scope: opts.Scope, DryRun: opts.DryRun}
 
-	res := &Result{Harness: HarnessOpenClaw, Scope: scope, DryRun: opts.DryRun}
-
-	if !opts.SkipMemory {
-		if isSymlink(defaultMem) {
-			target, err := os.Readlink(defaultMem)
+	if opts.IncludeMemory {
+		workspaces, err := openclawWorkspacesToBridge(home, opts.Scope)
+		if err != nil {
+			return nil, err
+		}
+		for _, ws := range workspaces {
+			defaultMem := openclawWorkspaceMem(home, ws)
+			vaultMem := openclawVaultMem(vaultRoot, ws)
+			steps, err := codexMemorySteps(defaultMem, vaultMem)
 			if err != nil {
-				return nil, fmt.Errorf("read existing symlink %s: %w", defaultMem, err)
+				return nil, fmt.Errorf("workspace %q: %w", ws, err)
 			}
-			if target != vaultMem {
-				return nil, fmt.Errorf("%s already symlinked to %s; remove it before bridging", defaultMem, target)
-			}
-			res.Steps = append(res.Steps, Step{
-				Kind:        "noop",
-				Description: fmt.Sprintf("%s already symlinked to %s — memory step skipped", defaultMem, vaultMem),
-			})
-		} else {
-			res.Steps = append(res.Steps, Step{
-				Kind:        "mkdir",
-				Description: fmt.Sprintf("ensure %s exists", vaultMem),
-				Apply: func() error {
-					return os.MkdirAll(vaultMem, 0o755)
-				},
-			})
-
-			if dirExists(defaultMem) && !isEmptyDir(defaultMem) {
-				res.Steps = append(res.Steps, Step{
-					Kind:        "copy",
-					Description: fmt.Sprintf("copy %s → %s", defaultMem, vaultMem),
-					Apply: func() error {
-						return copyTree(defaultMem, vaultMem)
-					},
-				})
-			}
-
-			if dirExists(defaultMem) {
-				res.Steps = append(res.Steps, Step{
-					Kind:        "rmdir",
-					Description: fmt.Sprintf("remove %s (after migration)", defaultMem),
-					Apply: func() error {
-						return os.RemoveAll(defaultMem)
-					},
-				})
-			}
-
-			res.Steps = append(res.Steps, Step{
-				Kind:        "symlink",
-				Description: fmt.Sprintf("symlink %s → %s", defaultMem, vaultMem),
-				Apply: func() error {
-					if err := os.MkdirAll(filepath.Dir(defaultMem), 0o755); err != nil {
-						return err
-					}
-					return os.Symlink(vaultMem, defaultMem)
-				},
-			})
+			res.Steps = append(res.Steps, steps...)
 		}
 	}
 
@@ -109,34 +77,46 @@ func planBridgeOpenClaw(scope, vaultRoot string, opts Options) (*Result, error) 
 		})
 	}
 
-	if !opts.DryRun {
-		for _, st := range res.Steps {
-			if st.Apply == nil {
-				continue
-			}
-			if err := st.Apply(); err != nil {
-				return res, fmt.Errorf("%s: %w", st.Description, err)
-			}
-			res.Executed++
-		}
+	if err := applySteps(res, opts.DryRun); err != nil {
+		return res, err
 	}
 	return res, nil
 }
 
-func planUnbridgeOpenClaw(scope, vaultRoot string, opts Options) (*Result, error) {
-	if scope == "" {
-		return nil, fmt.Errorf("openclaw unbridge requires a workspace name")
+// openclawWorkspacesToBridge returns the workspaces to bridge based on Scope.
+// scope == ""    → every dir under ~/.openclaw/ that has a memory/ child
+//                  (or could grow one). Empty list = nothing to bridge.
+// scope == "ws"  → []string{"ws"} unconditionally; bridge plan creates
+//                  the workspace memory dir if missing.
+func openclawWorkspacesToBridge(home, scope string) ([]string, error) {
+	if scope != "" {
+		return []string{scope}, nil
 	}
+	root := filepath.Join(home, openclawHomeRel)
+	names, err := listDirNames(root)
+	if err != nil {
+		return nil, err
+	}
+	// Filter to workspaces that have a memory/ subdir or appear to be
+	// workspace dirs (any dir at this level except the index dir "memory").
+	var out []string
+	for _, n := range names {
+		if n == "memory" {
+			continue // ~/.openclaw/memory/ is the global SQLite index
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+func planUnbridgeOpenClaw(vaultRoot string, opts Options) (*Result, error) {
 	home, err := homeDir()
 	if err != nil {
 		return nil, err
 	}
 
 	configPath := filepath.Join(home, openclawConfigRel)
-	defaultMem := filepath.Join(home, ".openclaw", scope, "memory")
-	vaultMem := vaultSubdir(vaultRoot, HarnessOpenClaw, scope)
-
-	res := &Result{Harness: HarnessOpenClaw, Scope: scope, DryRun: opts.DryRun}
+	res := &Result{Harness: HarnessOpenClaw, Scope: opts.Scope, DryRun: opts.DryRun}
 
 	if !opts.SkipMCP {
 		res.Steps = append(res.Steps, Step{
@@ -148,69 +128,90 @@ func planUnbridgeOpenClaw(scope, vaultRoot string, opts Options) (*Result, error
 		})
 	}
 
-	if !opts.SkipMemory {
-		if isSymlink(defaultMem) {
-			target, err := os.Readlink(defaultMem)
-			if err != nil {
-				return nil, fmt.Errorf("read symlink %s: %w", defaultMem, err)
-			}
-			if target != vaultMem {
-				return nil, fmt.Errorf("%s symlinks to %s, not %s; refusing to unbridge a different bridge", defaultMem, target, vaultMem)
-			}
-		} else if dirExists(defaultMem) {
-			return nil, fmt.Errorf("%s is a real directory (not a symlink); nothing to unbridge", defaultMem)
+	if opts.IncludeMemory {
+		workspaces, err := openclawWorkspacesToBridge(home, opts.Scope)
+		if err != nil {
+			return nil, err
 		}
+		for _, ws := range workspaces {
+			defaultMem := openclawWorkspaceMem(home, ws)
+			vaultMem := openclawVaultMem(vaultRoot, ws)
 
-		res.Steps = append(res.Steps, Step{
-			Kind:        "unlink",
-			Description: fmt.Sprintf("remove symlink %s", defaultMem),
-			Apply: func() error {
-				return os.Remove(defaultMem)
-			},
-		})
+			if isSymlink(defaultMem) {
+				target, err := os.Readlink(defaultMem)
+				if err != nil {
+					return nil, fmt.Errorf("workspace %q: read symlink %s: %w", ws, defaultMem, err)
+				}
+				if target != vaultMem {
+					return nil, fmt.Errorf("workspace %q: %s symlinks to %s, not %s; refusing to unbridge", ws, defaultMem, target, vaultMem)
+				}
+			} else if dirExists(defaultMem) {
+				return nil, fmt.Errorf("workspace %q: %s is a real directory (not a symlink); nothing to unbridge", ws, defaultMem)
+			} else {
+				continue // not bridged; skip
+			}
 
-		if dirExists(vaultMem) {
 			res.Steps = append(res.Steps, Step{
-				Kind:        "copy",
-				Description: fmt.Sprintf("copy %s → %s", vaultMem, defaultMem),
-				Apply: func() error {
-					if err := os.MkdirAll(defaultMem, 0o755); err != nil {
-						return err
-					}
-					return copyTree(vaultMem, defaultMem)
-				},
+				Kind:        "unlink",
+				Description: fmt.Sprintf("remove symlink %s", defaultMem),
+				Apply:       func() error { return os.Remove(defaultMem) },
 			})
-		}
 
-		if !opts.KeepVault {
-			res.Steps = append(res.Steps, Step{
-				Kind:        "rmdir",
-				Description: fmt.Sprintf("remove %s (vault subtree; --keep-vault to preserve)", vaultMem),
-				Apply: func() error {
-					return os.RemoveAll(vaultMem)
-				},
-			})
+			if dirExists(vaultMem) {
+				dm, vm := defaultMem, vaultMem
+				res.Steps = append(res.Steps, Step{
+					Kind:        "copy",
+					Description: fmt.Sprintf("copy %s → %s", vm, dm),
+					Apply: func() error {
+						if err := os.MkdirAll(dm, 0o755); err != nil {
+							return err
+						}
+						return copyTree(vm, dm)
+					},
+				})
+			}
+
+			if !opts.KeepVault {
+				vm := vaultMem
+				res.Steps = append(res.Steps, Step{
+					Kind:        "rmdir",
+					Description: fmt.Sprintf("remove %s (vault subtree; --keep-vault to preserve)", vm),
+					Apply:       func() error { return os.RemoveAll(vm) },
+				})
+			}
 		}
 	}
 
-	if !opts.DryRun {
-		for _, st := range res.Steps {
-			if st.Apply == nil {
-				continue
-			}
-			if err := st.Apply(); err != nil {
-				return res, fmt.Errorf("%s: %w", st.Description, err)
-			}
-			res.Executed++
-		}
+	if err := applySteps(res, opts.DryRun); err != nil {
+		return res, err
 	}
 	return res, nil
 }
 
+// listOpenClawScopes enumerates workspaces under ~/.openclaw/ (excluding
+// the index dir "memory").
+func listOpenClawScopes() ([]string, error) {
+	home, err := homeDir()
+	if err != nil {
+		return nil, err
+	}
+	root := filepath.Join(home, openclawHomeRel)
+	names, err := listDirNames(root)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, n := range names {
+		if n == "memory" {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
 // setOpenClawMCPServer adds mega-mem's MCP entry under mcp.servers in the
-// OpenClaw config. The `transport: "http"` field matches the convention
-// OpenClaw uses for HTTP/SSE-style MCP server URLs (as opposed to stdio
-// command/args entries). Other servers in mcp.servers are preserved.
+// OpenClaw config.
 func setOpenClawMCPServer(configPath, name, url string) error {
 	cfg, err := readJSONObject(configPath)
 	if err != nil {
@@ -266,9 +267,7 @@ func getOrCreateMap(parent map[string]any, key string) map[string]any {
 	return created
 }
 
-// writeJSONObjectPreservingFormat writes JSON with 2-space indent. OpenClaw
-// configs tend to be hand-edited; we don't try to preserve every quirk of
-// the original formatting, just produce valid JSON.
+// writeJSONObjectPreservingFormat writes JSON with 2-space indent.
 func writeJSONObjectPreservingFormat(path string, m map[string]any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
