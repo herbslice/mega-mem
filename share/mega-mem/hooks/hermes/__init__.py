@@ -8,9 +8,11 @@ Wires two hooks:
   user/) once at session start. Side-effect logging only — Hermes ignores
   on_session_start return values.
 
-Honors the machine-local toggle written by `mega-mem hooks {enable,disable}`
-at $XDG_CONFIG_HOME/mega-mem/state.yaml. When disabled, hooks return None
-(no injection) without touching anything else.
+Honors the machine-local toggles at $XDG_CONFIG_HOME/mega-mem/state.yaml.
+Kill-switch precedence: a global `hooks_enabled: false` disables every
+harness; otherwise the per-harness `hooks:` map (toggled via
+`mega-mem agents hooks {enable,disable} hermes`) decides. When disabled,
+hooks return None (no injection) without touching anything else.
 
 Configuration via environment variables (set in your shell or your Hermes
 launch script):
@@ -35,9 +37,13 @@ import urllib.request
 def _toggle_disabled(harness: str = "hermes") -> bool:
     """Return True if mega-mem's hooks are disabled for the named harness.
 
-    Honors both the v0.0.0 legacy global flag (`hooks_enabled: false`) and
-    the per-harness `hooks:` block (`hooks: { hermes: false }`). Absent file
-    or absent harness key returns False (fail-open: enabled).
+    Two layers, kill-switch precedence:
+      1. Global `hooks_enabled: false` disables every harness (hand-edit
+         only).
+      2. Per-harness `hooks: { hermes: false }` toggled via
+         `mega-mem agents hooks {enable,disable} hermes`.
+    Absent file, absent block, or absent harness key returns False
+    (fail-open: enabled).
     """
     xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
     state_file = os.path.join(xdg, "mega-mem", "state.yaml")
@@ -47,12 +53,12 @@ def _toggle_disabled(harness: str = "hermes") -> bool:
     except OSError:
         return False
 
-    # v0.0.0 legacy global flag.
+    # Global kill switch.
     for line in text.splitlines():
         if line.strip() == "hooks_enabled: false":
             return True
 
-    # v0.1.0+ per-harness flag: scan inside the `hooks:` block.
+    # Per-harness flag inside the `hooks:` block.
     in_hooks = False
     for line in text.splitlines():
         if line.startswith("hooks:") and (line.rstrip() == "hooks:" or line[6:].strip() == ""):

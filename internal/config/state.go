@@ -11,9 +11,9 @@ import (
 )
 
 // KnownHarnesses lists the canonical harness names mega-mem ships hook
-// recipes and bridge logic for. Used by state migration and by the
-// `agents hooks` --all flag. Kept in sync with bridge.SupportedHarnesses();
-// a test in the bridge package verifies the alignment.
+// recipes and bridge logic for. Used by the `agents hooks` --all flag.
+// Kept in sync with bridge.SupportedHarnesses(); a test in the bridge
+// package verifies the alignment.
 var KnownHarnesses = []string{"claude-code", "codex", "hermes", "openclaw"}
 
 // State captures machine-local mega-mem runtime flags that don't belong to a
@@ -21,32 +21,45 @@ var KnownHarnesses = []string{"claude-code", "codex", "hermes", "openclaw"}
 // $XDG_CONFIG_HOME/mega-mem/state.yaml. Schema is intentionally narrow —
 // add a new field rather than overloading existing ones.
 type State struct {
+	// HooksEnabled is the global kill switch. When set to false, every
+	// harness's hooks are disabled regardless of the per-harness Hooks
+	// map. When unset (nil) or true, the per-harness map decides.
+	// Hand-edit only — not currently exposed in the CLI; reach for it
+	// when you want to silence all mega-mem injection in one line, or
+	// to cover harnesses added later without updating the per-harness
+	// map.
+	HooksEnabled *bool `yaml:"hooks_enabled,omitempty"`
+
 	// Hooks gates per-harness mega-mem hook scripts. Map key is the
 	// canonical harness name. Absent key (or whole map nil) means hooks
 	// are enabled — fail-open default. Toggle via
 	// `mega-mem agents hooks {enable,disable} [<harness>]`.
 	Hooks map[string]bool `yaml:"hooks,omitempty"`
-
-	// LegacyHooksEnabled is the v0.0.0 top-level toggle. Read for
-	// backward compatibility; migrated into Hooks on first WriteState.
-	// Never written (omitempty + nil after LoadState completes migration).
-	LegacyHooksEnabled *bool `yaml:"hooks_enabled,omitempty"`
 }
 
 // HooksEnabledForHarness returns true when mega-mem's hook scripts for
-// the named harness should run. Absent key = enabled (fail-open).
-// nil receiver = enabled.
+// the named harness should run. Precedence: HooksEnabled=false acts as a
+// kill switch and disables every harness; otherwise the per-harness Hooks
+// map decides (absent key = enabled, fail-open). nil receiver = enabled.
 func (s *State) HooksEnabledForHarness(harness string) bool {
 	if s == nil {
 		return true
 	}
+	if s.HooksEnabled != nil && !*s.HooksEnabled {
+		return false
+	}
 	if v, ok := s.Hooks[harness]; ok {
 		return v
 	}
-	if s.LegacyHooksEnabled != nil {
-		return *s.LegacyHooksEnabled
-	}
 	return true
+}
+
+// KillSwitchActive reports whether the global hooks_enabled flag is
+// explicitly set to false. Useful for CLI status output that wants to
+// surface "all harnesses off because of a kill switch" vs. "all harnesses
+// individually disabled."
+func (s *State) KillSwitchActive() bool {
+	return s != nil && s.HooksEnabled != nil && !*s.HooksEnabled
 }
 
 // StatePath returns $XDG_CONFIG_HOME/mega-mem/state.yaml.
@@ -59,9 +72,8 @@ func StatePath() (string, error) {
 }
 
 // LoadState reads the state file. Missing file returns a zero-value State
-// (which behaves as "all defaults"). Migrates the legacy `hooks_enabled`
-// field into the per-harness `Hooks` map on read; subsequent WriteState
-// calls persist the new schema and drop the legacy key.
+// (which behaves as "all defaults" — every harness enabled, no kill
+// switch).
 func LoadState() (*State, error) {
 	path, err := StatePath()
 	if err != nil {
@@ -78,13 +90,6 @@ func LoadState() (*State, error) {
 	if err := yaml.Unmarshal(data, s); err != nil {
 		return nil, fmt.Errorf("parse state %s: %w", path, err)
 	}
-	if s.LegacyHooksEnabled != nil && len(s.Hooks) == 0 {
-		s.Hooks = make(map[string]bool, len(KnownHarnesses))
-		for _, h := range KnownHarnesses {
-			s.Hooks[h] = *s.LegacyHooksEnabled
-		}
-	}
-	s.LegacyHooksEnabled = nil
 	return s, nil
 }
 

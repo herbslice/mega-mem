@@ -19,17 +19,20 @@
 
 set -euo pipefail
 
-# Honor the machine-local per-harness toggle written by
-# `mega-mem agents hooks {enable,disable} claude-code`. Absent file, absent
-# `hooks:` block, or absent harness key all mean enabled (fail-open).
+# Honor the machine-local toggle at $XDG_CONFIG_HOME/mega-mem/state.yaml.
+# Two layers, kill-switch precedence:
+#   1. Global `hooks_enabled: false` disables every harness (hand-edit only).
+#   2. Per-harness `hooks: { claude-code: false }` toggled via
+#      `mega-mem agents hooks {enable,disable} claude-code`.
+# Absent file, absent block, or absent harness key all mean enabled (fail-open).
 state_file="${XDG_CONFIG_HOME:-$HOME/.config}/mega-mem/state.yaml"
 harness="claude-code"
 if [[ -f "$state_file" ]]; then
-  # v0.0.0 legacy: top-level `hooks_enabled: false` applies to all harnesses.
+  # Global kill switch.
   if grep -qE '^hooks_enabled:[[:space:]]*false[[:space:]]*$' "$state_file"; then
     exit 0
   fi
-  # v0.1.0+: scan the `hooks:` block for `<harness>: false`.
+  # Per-harness flag inside the `hooks:` block.
   value=$(awk -v h="$harness" '
     /^hooks:[[:space:]]*$/ { in_hooks=1; next }
     /^[^[:space:]]/ && in_hooks { in_hooks=0 }

@@ -15,7 +15,8 @@
 
 set -euo pipefail
 
-# Honor the machine-local per-harness toggle. See session-start.sh comment.
+# Honor the state-file toggles (kill switch + per-harness). See
+# session-start.sh for the full comment.
 state_file="${XDG_CONFIG_HOME:-$HOME/.config}/mega-mem/state.yaml"
 harness="claude-code"
 if [[ -f "$state_file" ]]; then

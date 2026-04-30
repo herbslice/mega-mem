@@ -462,7 +462,11 @@ func newHooksStatusCmd() *cobra.Command {
 				}
 				fmt.Printf("%-12s  %s\n", st.Harness, label)
 			}
-			fmt.Printf("\nstate: %s\n", path)
+			if s.KillSwitchActive() {
+				fmt.Printf("\nglobal kill switch: ACTIVE — hooks_enabled: false in %s overrides every per-harness flag\n", path)
+			} else {
+				fmt.Printf("\nstate: %s\n", path)
+			}
 			return nil
 		},
 	}

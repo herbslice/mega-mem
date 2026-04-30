@@ -26,11 +26,16 @@ emit_envelope() {
   fi
 }
 
-# Honor the machine-local per-harness toggle. Absent file, absent `hooks:`
-# block, or absent harness key all mean enabled (fail-open).
+# Honor the machine-local toggle at $XDG_CONFIG_HOME/mega-mem/state.yaml.
+# Two layers, kill-switch precedence:
+#   1. Global `hooks_enabled: false` disables every harness (hand-edit only).
+#   2. Per-harness `hooks: { codex: false }` toggled via
+#      `mega-mem agents hooks {enable,disable} codex`.
+# Absent file, absent block, or absent harness key all mean enabled (fail-open).
 state_file="${XDG_CONFIG_HOME:-$HOME/.config}/mega-mem/state.yaml"
 harness="codex"
 if [[ -f "$state_file" ]]; then
+  # Global kill switch.
   if grep -qE '^hooks_enabled:[[:space:]]*false[[:space:]]*$' "$state_file"; then
     emit_envelope ""
     exit 0

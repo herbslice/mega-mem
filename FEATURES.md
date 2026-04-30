@@ -76,7 +76,7 @@ mega-mem does not ship a UI; it builds the layer that makes any UI work better. 
 - **Hook recipes for Hermes** (Python plugin under `share/mega-mem/hooks/hermes/`):
   - `pre_llm_call` — per-turn `recall`; injected via `{"context": "..."}`.
   - `on_session_start` — loads static context for observability.
-- **Per-harness hook toggle** — `mega-mem agents hooks {enable,disable} [<harness>]` writes `hooks: { <harness>: bool }` in `~/.config/mega-mem/state.yaml`. Hook scripts read the per-harness key at the top of each invocation; absent key = enabled (fail-open). Legacy v0.0.0 `hooks_enabled: <bool>` is migrated automatically on first write.
+- **Per-harness hook toggle** — `mega-mem agents hooks {enable,disable} [<harness>]` writes `hooks: { <harness>: bool }` in `~/.config/mega-mem/state.yaml`. Hook scripts read the per-harness key at the top of each invocation; absent key = enabled (fail-open). A top-level `hooks_enabled: false` (hand-edit only) acts as a global kill switch: when set, every harness's hooks are disabled regardless of the per-harness map. Useful for one-line silencing across all harnesses, including ones added in the future without explicit per-harness entries.
 - **`docs/SYNC-SUGGESTIONS.md`** — cross-machine recipes (Syncthing, VS Code Remote SSH, plain git push/pull, Tailscale + sshfs, conflict handling).
 - **GoReleaser config** — linux-amd64/arm64, darwin-amd64/arm64 tarballs + Homebrew tap + optional Docker image; Windows deferred
 - **Install script** — `curl -fsSL <url> | bash` for macOS + Linux, OS/arch auto-detect

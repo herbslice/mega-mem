@@ -98,41 +98,90 @@ func TestState_HooksEnabledForHarness_NilSafe(t *testing.T) {
 	}
 }
 
-func TestLegacyMigration(t *testing.T) {
+// TestKillSwitch_DisablesAllHarnesses verifies that hand-editing a global
+// `hooks_enabled: false` disables every known harness regardless of the
+// per-harness map.
+func TestKillSwitch_DisablesAllHarnesses(t *testing.T) {
 	withFakeXDG(t, func(xdg string) {
 		statePath := filepath.Join(xdg, "mega-mem", "state.yaml")
 		if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
-		// Write the legacy v0.0.0 format manually.
-		if err := os.WriteFile(statePath, []byte("hooks_enabled: false\n"), 0o644); err != nil {
-			t.Fatalf("write legacy state: %v", err)
+		// Hand-edited state: kill switch on, with one harness explicitly
+		// enabled to confirm the kill switch wins.
+		body := "hooks_enabled: false\nhooks:\n    codex: true\n"
+		if err := os.WriteFile(statePath, []byte(body), 0o644); err != nil {
+			t.Fatalf("write state: %v", err)
 		}
 
 		s, err := LoadState()
 		if err != nil {
 			t.Fatalf("LoadState: %v", err)
 		}
-		// Legacy false should disable every known harness.
+		if !s.KillSwitchActive() {
+			t.Errorf("KillSwitchActive() = false, want true")
+		}
 		for _, h := range KnownHarnesses {
 			if s.HooksEnabledForHarness(h) {
-				t.Errorf("%s = enabled, want disabled (legacy false should propagate)", h)
+				t.Errorf("%s = enabled, want disabled (kill switch should win over per-harness)", h)
 			}
 		}
+	})
+}
 
-		// Persist; legacy field should be gone, per-harness map should remain.
-		if err := WriteState(s); err != nil {
-			t.Fatalf("WriteState: %v", err)
+// TestKillSwitch_PersistsThroughWrite verifies that the global flag is a
+// peer field and survives a load → write round-trip — there's no
+// migration that drops it.
+func TestKillSwitch_PersistsThroughWrite(t *testing.T) {
+	withFakeXDG(t, func(xdg string) {
+		statePath := filepath.Join(xdg, "mega-mem", "state.yaml")
+		if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(statePath, []byte("hooks_enabled: false\n"), 0o644); err != nil {
+			t.Fatalf("write state: %v", err)
+		}
+
+		// Round-trip via the CLI's per-harness toggle — should not touch
+		// the global flag.
+		if err := SetHooksEnabledForHarness("codex", true); err != nil {
+			t.Fatalf("SetHooksEnabledForHarness: %v", err)
 		}
 		data, err := os.ReadFile(statePath)
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		if strings.Contains(string(data), "hooks_enabled") {
-			t.Errorf("legacy hooks_enabled key still in state file after migration: %q", data)
+		if !strings.Contains(string(data), "hooks_enabled: false") {
+			t.Errorf("global hooks_enabled flag dropped after CLI write; got %q", data)
 		}
-		if !strings.Contains(string(data), "hooks:") {
-			t.Errorf("new hooks: block missing after migration: %q", data)
+	})
+}
+
+// TestKillSwitch_TrueIsNoop verifies that hooks_enabled: true is
+// equivalent to absent — per-harness map decides, fail-open default.
+func TestKillSwitch_TrueIsNoop(t *testing.T) {
+	withFakeXDG(t, func(xdg string) {
+		statePath := filepath.Join(xdg, "mega-mem", "state.yaml")
+		if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		body := "hooks_enabled: true\nhooks:\n    codex: false\n"
+		if err := os.WriteFile(statePath, []byte(body), 0o644); err != nil {
+			t.Fatalf("write state: %v", err)
+		}
+
+		s, err := LoadState()
+		if err != nil {
+			t.Fatalf("LoadState: %v", err)
+		}
+		if s.KillSwitchActive() {
+			t.Errorf("KillSwitchActive() = true with hooks_enabled: true, want false")
+		}
+		if s.HooksEnabledForHarness("codex") {
+			t.Errorf("codex = enabled, want disabled (per-harness false)")
+		}
+		if !s.HooksEnabledForHarness("claude-code") {
+			t.Errorf("claude-code = disabled, want enabled (absent key, fail-open)")
 		}
 	})
 }
