@@ -1,0 +1,45 @@
+# Example engine config for mega-mem.
+#
+# Machine-local. Points the mega-mem process at a vault and configures
+# runtime knobs. Save as:
+#
+#   ~/.config/mega-mem/engines/<alias>.yaml
+#
+# Then `mega-mem vault <alias> serve` loads it automatically. Override
+# with `--config <file>`.
+#
+# Environment expansion: $VAR and ${VAR} in any string field are
+# substituted from the process environment before parse (Bash semantics
+# via os.ExpandEnv). Unset variables expand to empty strings. Useful for
+# portable paths (${HOME}/...) and keeping secrets out of plaintext.
+
+# Required. Absolute path to the vault directory; must already exist.
+# Create the vault via:
+#   mega-mem vaults register <alias> <path>
+#   mega-mem vault <alias> init
+vault_path: ${HOME}/knowledge
+
+# MCP server bind address. Default 127.0.0.1:8111.
+#   127.0.0.1:8111   loopback only (typical)
+#   0.0.0.0:8111     any interface (LAN; pair with auth at the proxy)
+#   <iface-ip>:8111  specific interface (e.g. Wireguard)
+bind: 127.0.0.1:8111
+
+# Embedding provider for the `recall` tool.
+# `recall` is a v0.1.0 milestone — this block is parsed today but
+# unused until the recall implementation ships.
+embedding:
+  provider: ollama
+  endpoint: http://localhost:11434
+  model: nomic-embed-text
+  # api_key: ${OLLAMA_API_KEY}   # hosted providers only
+
+# Optional. Extra harness-native memory stores to surface under
+# <vault>/agent-memory/<name>/ alongside anything `agents bridge`
+# wired up. Useful for tools mega-mem doesn't natively bridge.
+# agent_memory:
+#   - name: my-tool
+#     path: /home/you/.my-tool/memory
+
+# Log level. Default info.
+log_level: info

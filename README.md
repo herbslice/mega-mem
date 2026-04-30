@@ -42,6 +42,13 @@ mega-mem vault mykb init
 # wire mega-mem's MCP server into your harness (default: MCP only)
 mega-mem agents bridge --apply claude-code
 
+# create the machine-local engine config — see docs/engine-config.example.yaml
+# for the full schema. $VAR / ${VAR} are expanded from the environment.
+mkdir -p ~/.config/mega-mem/engines
+cat > ~/.config/mega-mem/engines/mykb.yaml <<'EOF'
+vault_path: ${HOME}/knowledge
+EOF
+
 # run the MCP server (loads ~/.config/mega-mem/engines/mykb.yaml by default)
 mega-mem vault mykb serve
 ```

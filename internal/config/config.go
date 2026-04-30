@@ -71,6 +71,7 @@ func LoadEngine(path string) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read engine config %s: %w", path, err)
 	}
+	data = expandEnv(data)
 	e := &Engine{
 		Bind:     "127.0.0.1:8111",
 		LogLevel: "info",
@@ -116,6 +117,7 @@ func LoadVault(vaultPath string) (*Vault, error) {
 		}
 		return nil, fmt.Errorf("read vault config %s: %w", path, err)
 	}
+	data = expandEnv(data)
 	v := &Vault{}
 	if err := yaml.Unmarshal(data, v); err != nil {
 		return nil, fmt.Errorf("parse vault config %s: %w", path, err)
@@ -158,6 +160,7 @@ func LoadRegistry() (*Registry, error) {
 		}
 		return nil, fmt.Errorf("read registry %s: %w", path, err)
 	}
+	data = expandEnv(data)
 	r := &Registry{}
 	if err := yaml.Unmarshal(data, r); err != nil {
 		return nil, fmt.Errorf("parse registry %s: %w", path, err)
@@ -214,6 +217,16 @@ func DefaultVaultPath(alias string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "mega-mem", "vaults", alias), nil
+}
+
+// expandEnv replaces $VAR and ${VAR} references in YAML bytes with values
+// from the process environment. Unset variables expand to empty strings
+// (matching Bash and os.ExpandEnv). Applied before yaml.Unmarshal so any
+// string field — vault_path, embedding.endpoint, api_key, agent_memory
+// paths — can reference environment values for portability across
+// machines and to keep secrets out of plaintext config.
+func expandEnv(data []byte) []byte {
+	return []byte(os.ExpandEnv(string(data)))
 }
 
 func xdgConfigHome() (string, error) {
