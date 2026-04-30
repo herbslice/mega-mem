@@ -283,6 +283,7 @@ func excludeTomlSection(input, header string) (string, bool) {
 			out.WriteByte('\n')
 		}
 	}
+	// Best-effort error swallow on read; we already have what we processed.
 	_ = scanner.Err()
 	return out.String(), found
 }
